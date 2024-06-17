@@ -99,6 +99,11 @@ class CathCanonicalAnglesDataset(Dataset):
         "coords": [False, False, False],
     }
 
+    noise_mask = {
+        "angles": [True, True, True, True, True, True, True, True, True] + [False for _ in range(len(AMINO_ACID_LIST))],
+        "coords": [True, True, True],
+    }
+
     def __init__(
         self,
         pdbs: Union[
@@ -511,6 +516,7 @@ class CathCanonicalAnglesSequenceDataset(CathCanonicalAnglesDataset):
 
     feature_names = {"angles": ["phi", "psi", "omega", "tau", "CA:C:1N", "C:1N:1CA"] + AMINO_ACID_LIST}
     feature_is_angular = {"angles": [True, True, True, True, True, True] + [False for _ in range(len(AMINO_ACID_LIST))]}
+    noise_mask = {"angles": [True, True, True, True, True, True] + [False for _ in range(len(AMINO_ACID_LIST))]}
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -851,6 +857,9 @@ class NoisedAnglesDataset(Dataset):
         noise[..., angular_idx] = utils.modulo_with_wrapped_range(
             noise[..., angular_idx], -np.pi, np.pi
         )
+
+        # Don't add noise to features where noise mask is zero
+        noise[..., ~self.dset.noise_mask[self.dset_key]] = 0.0
 
         return noise
 
