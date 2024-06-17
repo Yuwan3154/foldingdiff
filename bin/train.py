@@ -138,6 +138,7 @@ def get_train_valid_test_sets(
         "canonical-full-angles": datasets.CathCanonicalAnglesOnlyDataset,
         "canonical-minimal-angles": datasets.CathCanonicalMinimalAnglesDataset,
         "cart-coords": datasets.CathCanonicalCoordsDataset,
+        "canonical-full-angles-sequence": datasets.CathCanonicalAnglesSequenceDataset,
     }[angles_definitions]
     logging.info(f"Clean dataset class: {clean_dset_class}")
 

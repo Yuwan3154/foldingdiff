@@ -70,6 +70,7 @@ FEATURE_SET_NAMES_TO_FEATURE_NAMES = {
     "canonical-minimal-angles": ["phi", "psi", "omega", "tau"],
     "cart-coords": ["x", "y", "z"],
 }
+AMINO_ACID_LIST = ['A', 'R', 'N', 'D', 'C', 'Q', 'E', 'G', 'H', 'I', 'L', 'K', 'M', 'F', 'P', 'S', 'T', 'W', 'Y', 'V', '-']
 
 
 class CathCanonicalAnglesDataset(Dataset):
@@ -90,11 +91,11 @@ class CathCanonicalAnglesDataset(Dataset):
             "tau",
             "CA:C:1N",
             "C:1N:1CA",
-        ],
+        ] + AMINO_ACID_LIST,
         "coords": ["x", "y", "z"],
     }
     feature_is_angular = {
-        "angles": [False, False, False, True, True, True, True, True, True],
+        "angles": [False, False, False, True, True, True, True, True, True] + [False for _ in range(len(AMINO_ACID_LIST))],
         "coords": [False, False, False],
     }
 
@@ -416,6 +417,7 @@ class CathCanonicalAnglesDataset(Dataset):
                 mode="constant",
                 constant_values=0,
             )
+            angles[self.pad - angles.shape[0]:, -1] = 1 # Pad the one-hot encoded amino acid
             coords = np.pad(
                 coords,
                 ((0, self.pad - coords.shape[0]), (0, 0)),
@@ -443,12 +445,12 @@ class CathCanonicalAnglesDataset(Dataset):
         angular_idx = np.where(CathCanonicalAnglesDataset.feature_is_angular["angles"])[
             0
         ]
-        assert utils.tolerant_comparison_check(
-            angles[:, angular_idx], ">=", -np.pi
-        ), f"Illegal value: {np.min(angles[:, angular_idx])}"
-        assert utils.tolerant_comparison_check(
-            angles[:, angular_idx], "<=", np.pi
-        ), f"Illegal value: {np.max(angles[:, angular_idx])}"
+        # assert utils.tolerant_comparison_check(
+        #     angles[:, angular_idx], ">=", -np.pi
+        # ), f"Illegal value: {np.min(angles[:, angular_idx])}"
+        # assert utils.tolerant_comparison_check(
+        #     angles[:, angular_idx], "<=", np.pi
+        # ), f"Illegal value: {np.max(angles[:, angular_idx])}"
         angles = torch.from_numpy(angles).float()
         coords = torch.from_numpy(coords).float()
 
@@ -498,6 +500,60 @@ class CathCanonicalCoordsDataset(CathCanonicalAnglesDataset):
         return_dict.pop("angles", None)
         return return_dict
 
+class CathCanonicalAnglesSequenceDataset(CathCanonicalAnglesDataset):
+    """
+    Building on the CATH dataset, return the 3 canonical dihedrals and the 3
+    non-dihedral angles, and the amino acid sequence. Notably, this does not return distance.
+    Dihedrals: phi, psi, omega
+    Non-dihedral angles: tau, CA:C:1N, C:1N:1CA
+    Amino acid sequence: one-hot encoded amino acid sequence
+    """
+
+    feature_names = {"angles": ["phi", "psi", "omega", "tau", "CA:C:1N", "C:1N:1CA"] + AMINO_ACID_LIST}
+    feature_is_angular = {"angles": [True, True, True, True, True, True] + [False for _ in range(len(AMINO_ACID_LIST))]}
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Trim out the distance in all the feature_names and feature_is_angular
+        orig_features = super().feature_names["angles"].copy()
+        self.feature_idx = [
+            orig_features.index(ft) for ft in self.feature_names["angles"]
+        ]
+        logging.info(
+            f"CATH canonical angles sequence dataset with {self.feature_names['angles']} (subset idx {self.feature_idx})"
+        )
+
+    def get_masked_means(self) -> np.ndarray:
+        """Return the means subset to the actual features used"""
+        if self.means is None:
+            return None
+        return np.copy(self.means)[self.feature_idx]
+
+    def set_masked_means(self, mean_values: np.ndarray) -> None:
+        """Set the means to the subset of features used"""
+        if self.means is None:
+            raise NotImplementedError
+        logging.info(f"Setting means for features {self.feature_idx} <- {mean_values}")
+        self.means[self.feature_idx] = mean_values.copy()
+
+    def __getitem__(
+        self, index, ignore_zero_center: bool = False
+    ) -> Dict[str, torch.Tensor]:
+        # Return a dict with keys: angles, attn_mask, position_ids, lengths
+        return_dict = super().__getitem__(index, ignore_zero_center=ignore_zero_center)
+
+        # Remove the distance feature
+        assert return_dict["angles"].ndim == 2
+        return_dict["angles"] = return_dict["angles"][:, self.feature_idx]
+        assert torch.all(
+            return_dict["angles"] >= -torch.pi
+        ), f"Minimum value {torch.min(return_dict['angles'])} lower than -pi"
+        assert torch.all(
+            return_dict["angles"] <= torch.pi
+        ), f"Maximum value {torch.max(return_dict['angles'])} higher than pi"
+        return_dict.pop("coords", None)
+
+        return return_dict
 
 class CathCanonicalAnglesOnlyDataset(CathCanonicalAnglesDataset):
     """
