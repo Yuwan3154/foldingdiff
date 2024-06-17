@@ -20,11 +20,16 @@ from biotite.sequence import ProteinSequence
 
 from foldingdiff import nerf
 
+from sklearn.preprocessing import OneHotEncoder
+
 EXHAUSTIVE_ANGLES = ["phi", "psi", "omega", "tau", "CA:C:1N", "C:1N:1CA"]
 EXHAUSTIVE_DISTS = ["0C:1N", "N:CA", "CA:C"]
 
 MINIMAL_ANGLES = ["phi", "psi", "omega"]
 MINIMAL_DISTS = []
+
+AMINO_ACID_LIST = ['A', 'R', 'N', 'D', 'C', 'Q', 'E', 'G', 'H', 'I', 'L', 'K', 'M', 'F', 'P', 'S', 'T', 'W', 'Y', 'V', '-']
+UNSUPPORTED_AMINO_ACID_LIST = ['B', 'Z', 'X', '*']
 
 
 def canonical_distances_and_dihedrals(
@@ -106,7 +111,39 @@ def canonical_distances_and_dihedrals(
             raise ValueError(f"Unrecognized distance: {d}")
         calc_angles[d] = struc.index_distance(backbone_atoms, indices=idx.astype(int))
 
-    return pd.DataFrame({k: calc_angles[k].squeeze() for k in distances + angles})
+    aa_seq = []
+    for _, res_atoms in groupby(source_struct, key=lambda a: a.res_id):
+        res_atoms = struc.array(list(res_atoms))
+        try:
+            residue = ProteinSequence.convert_letter_3to1(res_atoms[0].res_name)
+            # Changing unsupported amino acids into padding
+            if residue == "-":
+                continue
+            residue = "-" if residue in UNSUPPORTED_AMINO_ACID_LIST else residue
+        except KeyError:
+            logging.warning(
+                f"{fname}: Changing unknown residue {res_atoms[0].res_name} to padding"
+            )
+            residue = "-"
+        aa_seq.append(residue)
+
+    # One-hot encode the amino acid sequence
+    encoder = OneHotEncoder(categories=[AMINO_ACID_LIST])
+    aa_seq_encoded = encoder.fit_transform(np.array(aa_seq).reshape(-1, 1)).toarray()
+    calc_angles.update(dict(zip(AMINO_ACID_LIST, aa_seq_encoded.T)))
+    
+    # if fname == "/home/ubuntu/solab-ca/foldingdiff_af/foldingdiff/data/cath/dompdb/1ryp100":
+    #     for k in distances + angles + AMINO_ACID_LIST: print(f"feature {k} with length: {len(calc_angles[k].squeeze())}\n")
+    #     raise SyntaxError
+
+    if len(aa_seq) != len(calc_angles["phi"]):
+        print(f"Skipping {fname} due to mismatched residue and dihedral lengths")
+        # for k in distances + angles + AMINO_ACID_LIST: print(f"feature {k} with length: {len(calc_angles[k].squeeze())}\n")
+        return None
+
+    pd_dict = {k: calc_angles[k].squeeze() for k in distances + angles + AMINO_ACID_LIST}
+    assert all(len(v) == len(pd_dict["phi"]) for v in pd_dict.values()), fname
+    return pd.DataFrame(pd_dict)
 
 
 def create_new_chain_nerf(
