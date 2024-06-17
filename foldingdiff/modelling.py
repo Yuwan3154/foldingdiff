@@ -243,6 +243,7 @@ class BertForDiffusionBase(BertPreTrainedModel):
         ft_names: Optional[List[str]] = None,
         time_encoding: TIME_ENCODING = "gaussian_fourier",
         decoder: DECODER_HEAD = "mlp",
+        noise_mask: torch.Tensor = None,
     ) -> None:
         """
         dim should be the dimension of the inputs
@@ -270,11 +271,18 @@ class BertForDiffusionBase(BertPreTrainedModel):
         self.embeddings = BertEmbeddings(config)
         self.encoder = BertEncoder(config)
 
-        # Set up the network to project token representation to our four outputs
+        # Set up the network to project token representation to our outputs
+        if noise_mask is not None:
+            assert noise_mask.shape[0] == self.n_inputs, f"Length of noise mask doesn't match number of features: {noise_mask.shape[0]} != {self.n_inputs}"
+            self.noise_mask = noise_mask
+        else:
+            self.noise_mask = torch.ones(self.n_inputs, dtype=torch.bool)
+
+        self.n_outputs = self.noise_mask.count_nonzero().item()
         if decoder == "linear":
-            self.token_decoder = nn.Linear(config.hidden_size, n_inputs)
+            self.token_decoder = nn.Linear(config.hidden_size, self.n_outputs)
         elif decoder == "mlp":
-            self.token_decoder = AnglesPredictor(config.hidden_size, n_inputs)
+            self.token_decoder = AnglesPredictor(config.hidden_size, self.n_outputs)
         else:
             raise ValueError(f"Unrecognized decoder: {decoder}")
 
@@ -446,7 +454,7 @@ class BertForDiffusionBase(BertPreTrainedModel):
         # from hugggingface modeling_utils
         assert (
             attention_mask.dim() == 2
-        ), f"Attention mask expected in shape (batch_size, seq_length), got {attention_mask.shape}"
+        ), f"Attention mask expected in shape {(batch_size, seq_length)}, got {attention_mask.shape}"
         extended_attention_mask = attention_mask[:, None, None, :]
         extended_attention_mask = extended_attention_mask.type_as(attention_mask)
         extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
@@ -510,7 +518,7 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         # loss function is either a callable or a list of callables
         if isinstance(loss, str):
             logging.info(
-                f"Mapping loss {loss} to list of losses corresponding to angular {self.ft_is_angular}"
+                f"Mapping loss {loss} to list of losses corresponding to angular {self.ft_is_angular[self.noise_mask]}"
             )
             if loss in self.loss_autocorrect_dict:
                 logging.info(
@@ -523,7 +531,7 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
                 self.angular_loss_fn_dict[loss]
                 if is_angular
                 else self.nonangular_loss_fn_dict[loss]
-                for is_angular in self.ft_is_angular
+                for is_angular in self.ft_is_angular[self.noise_mask]
             ]
         else:
             logging.warning(
@@ -533,8 +541,8 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         pl.utilities.rank_zero_info(f"Using loss: {self.loss_func}")
         if isinstance(self.loss_func, (tuple, list)):
             assert (
-                len(self.loss_func) == self.n_inputs
-            ), f"Got {len(self.loss_func)} loss functions, expected {self.n_inputs}"
+                len(self.loss_func) == self.n_outputs
+            ), f"Got {len(self.loss_func)} loss functions, expected {self.n_outputs}"
 
         self.use_pairwise_dist_loss = use_pairwise_dist_loss
         self.l1_lambda = l1
