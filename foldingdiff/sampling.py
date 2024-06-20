@@ -23,6 +23,9 @@ from foldingdiff import datasets as dsets
 from foldingdiff import beta_schedules, modelling, utils, sampling, tmalign
 from foldingdiff import angles_and_coords as ac
 
+from sklearn.preprocessing import OneHotEncoder
+AMINO_ACID_LIST = ['A', 'R', 'N', 'D', 'C', 'Q', 'E', 'G', 'H', 'I', 'L', 'K', 'M', 'F', 'P', 'S', 'T', 'W', 'Y', 'V', '-']
+
 
 @torch.no_grad()
 def p_sample(
@@ -30,7 +33,6 @@ def p_sample(
     x: torch.Tensor,
     t: torch.Tensor,
     seq_lens: Sequence[int],
-    t_index: torch.Tensor,
     betas: torch.Tensor,
 ) -> torch.Tensor:
     """
@@ -111,7 +113,6 @@ def p_sample_loop(
             x=img,
             t=torch.full((b,), i, device=device, dtype=torch.long),  # time vector
             seq_lens=lengths,
-            t_index=i,
             betas=betas,
         )
 
@@ -264,6 +265,98 @@ def sample_simple(
     return sampled_dfs
 
 
+def sample_fragment(
+    model: nn.Module,
+    train_dset: dsets.NoisedAnglesDataset,
+    n: int = 780,
+    sweep_lengths: Optional[Tuple[int, int]] = (9, 10),
+    batch_size: int = 512,
+    feature_key: str = "angles",
+    disable_pbar: bool = False,
+    trim_to_length: bool = True,  # Trim padding regions to reduce memory
+) -> List[np.ndarray]:
+    """
+    Sample from the given model. Use the train_dset to generate noise to sample
+    sequence lengths. Returns a list of arrays, shape (timesteps, seq_len, fts).
+    If sweep_lengths is set, we generate n items per length in the sweep range
+
+    train_dset object must support:
+    - sample_noise - provided by NoisedAnglesDataset
+    - timesteps - provided by NoisedAnglesDataset
+    - alpha_beta_terms - provided by NoisedAnglesDataset
+    - feature_is_angular - provided by *wrapped dataset* under NoisedAnglesDataset
+    - pad - provided by *wrapped dataset* under NoisedAnglesDataset
+    And optionally, sample_length()
+    """
+    # Process each batch
+    if sweep_lengths is not None:
+        sweep_min, sweep_max = sweep_lengths
+        if not sweep_min < sweep_max:
+            raise ValueError(
+                f"Minimum length {sweep_min} must be less than maximum {sweep_max}"
+            )
+        logging.info(
+            f"Sweeping from {sweep_min}-{sweep_max} with {n} examples at each length"
+        )
+        lengths = []
+        for l in range(sweep_min, sweep_max):
+            lengths.extend([l] * n)
+    else:
+        lengths = [train_dset.sample_length() for _ in range(n)]
+    lengths_chunkified = [
+        lengths[i : i + batch_size] for i in range(0, len(lengths), batch_size)
+    ]
+
+    logging.info(f"Sampling {len(lengths)} items in batches of size {batch_size}")
+    retval = []
+    for this_lengths in lengths_chunkified:
+        batch = len(this_lengths)
+        # Sample noise and sample the lengths
+        noise = train_dset.sample_noise(
+            torch.zeros((batch, train_dset.pad, model.n_inputs), dtype=torch.float32)
+        )
+
+        # Trim things that are beyond the length of what we are generating
+        if trim_to_length:
+            noise = noise[:, : max(this_lengths), :]
+
+        # Produces (timesteps, batch_size, seq_len, n_ft)
+        sampled = p_sample_loop(
+            model=model,
+            lengths=this_lengths,
+            noise=noise,
+            timesteps=train_dset.timesteps,
+            betas=train_dset.alpha_beta_terms["betas"],
+            is_angle=train_dset.feature_is_angular[feature_key],
+            disable_pbar=disable_pbar,
+        )
+        # Gets to size (timesteps, seq_len, n_ft)
+        trimmed_sampled = [
+            sampled[:, i, :l, :].numpy() for i, l in enumerate(this_lengths)
+        ]
+        retval.extend(trimmed_sampled)
+    # Note that we don't use means variable here directly because we may need a subset
+    # of it based on which features are active in the dataset. The function
+    # get_masked_means handles this gracefully
+    if (
+        hasattr(train_dset, "dset")
+        and hasattr(train_dset.dset, "get_masked_means")
+        and train_dset.dset.get_masked_means() is not None
+    ):
+        logging.info(
+            f"Shifting predicted values by original offset: {train_dset.dset.get_masked_means()}"
+        )
+        retval = [s + train_dset.dset.get_masked_means() for s in retval]
+        # Because shifting may have caused us to go across the circle boundary, re-wrap
+        angular_idx = np.where(train_dset.feature_is_angular[feature_key])[0]
+        for s in retval:
+            s[..., angular_idx] = utils.modulo_with_wrapped_range(
+                s[..., angular_idx], range_min=-np.pi, range_max=np.pi
+            )
+
+    return retval
+
+
 def _score_angles(
     reconst_angles: pd.DataFrame, truth_angles: pd.DataFrame, truth_coords_pdb: str
 ) -> Tuple[float, float]:
@@ -324,7 +417,6 @@ def get_reconstruction_error(
                     device
                 ),
                 seq_lens=batch["lengths"],
-                t_index=i,
                 betas=dset.alpha_beta_terms["betas"],
             )
             img = utils.modulo_with_wrapped_range(img)

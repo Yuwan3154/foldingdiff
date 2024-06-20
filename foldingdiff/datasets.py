@@ -219,6 +219,8 @@ class CathCanonicalAnglesDataset(Dataset):
             assert structures_concat.ndim == 2
             self.means = cm.wrapped_mean(structures_concat, axis=0)
             assert self.means.shape == (structures_concat.shape[1],)
+            # Zero out the means for non-noised features (i.e. amino acid sequence)
+            self.means[~CathCanonicalAnglesDataset.noise_mask["angles"]] = 0.0
             # Subtract the mean and perform modulo where values are radial
             logging.info(
                 f"Offsetting features {self.feature_names['angles']} by means {self.means}"
@@ -516,15 +518,15 @@ class CathCanonicalAnglesSequenceDataset(CathCanonicalAnglesDataset):
 
     feature_names = {"angles": ["phi", "psi", "omega", "tau", "CA:C:1N", "C:1N:1CA"] + AMINO_ACID_LIST}
     feature_is_angular = {"angles": [True, True, True, True, True, True] + [False for _ in range(len(AMINO_ACID_LIST))]}
-    noise_mask = {"angles": [True, True, True, True, True, True] + [False for _ in range(len(AMINO_ACID_LIST))]}
+    noise_mask = {"angles": torch.tensor([True, True, True, True, True, True] + [False for _ in range(len(AMINO_ACID_LIST))]).bool()}
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         # Trim out the distance in all the feature_names and feature_is_angular
         orig_features = super().feature_names["angles"].copy()
-        self.feature_idx = [
+        self.feature_idx = torch.Tensor([
             orig_features.index(ft) for ft in self.feature_names["angles"]
-        ]
+        ]).int()
         logging.info(
             f"CATH canonical angles sequence dataset with {self.feature_names['angles']} (subset idx {self.feature_idx})"
         )
@@ -533,14 +535,14 @@ class CathCanonicalAnglesSequenceDataset(CathCanonicalAnglesDataset):
         """Return the means subset to the actual features used"""
         if self.means is None:
             return None
-        return np.copy(self.means)[self.feature_idx]
+        return np.copy(self.means)[self.feature_idx[self.noise_mask["angles"]]]
 
     def set_masked_means(self, mean_values: np.ndarray) -> None:
         """Set the means to the subset of features used"""
         if self.means is None:
             raise NotImplementedError
-        logging.info(f"Setting means for features {self.feature_idx} <- {mean_values}")
-        self.means[self.feature_idx] = mean_values.copy()
+        logging.info(f"Setting means for features {self.feature_idx[self.noise_mask['angles']]} <- {mean_values}")
+        self.means[self.feature_idx[self.noise_mask["angles"]]] = mean_values.copy()
 
     def __getitem__(
         self, index, ignore_zero_center: bool = False
@@ -858,9 +860,6 @@ class NoisedAnglesDataset(Dataset):
             noise[..., angular_idx], -np.pi, np.pi
         )
 
-        # Don't add noise to features where noise mask is zero
-        noise[..., ~self.dset.noise_mask[self.dset_key]] = 0.0
-
         return noise
 
     def __getitem__(
@@ -923,9 +922,12 @@ class NoisedAnglesDataset(Dataset):
         noise = self.sample_noise(vals)  # Vals passed in only for shape
 
         # Add noise and ensure noised vals are still in range
+        # TODO: Modify the noising process such that the amino acid sequence is not noised
         noised_vals = (
             sqrt_alphas_cumprod_t * vals + sqrt_one_minus_alphas_cumprod_t * noise
         )
+        # For the amino acid sequence, we should not add noise
+        noised_vals[..., ~self.dset.noise_mask[self.dset_key]] = vals[..., ~self.dset.noise_mask[self.dset_key]]
         assert noised_vals.shape == vals.shape, f"Unexpected shape {noised_vals.shape}"
         # The underlying vals are already shifted, and noise is already shifted
         # All we need to do is ensure we stay on the corresponding manifold
