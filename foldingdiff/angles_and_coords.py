@@ -137,7 +137,7 @@ def canonical_distances_and_dihedrals(
     #     raise SyntaxError
 
     if len(aa_seq) != len(calc_angles["phi"]):
-        print(f"Skipping {fname} due to mismatched residue and dihedral lengths")
+        # logging.warning(f"Skipping {fname} due to mismatched residue and dihedral lengths")
         # for k in distances + angles + AMINO_ACID_LIST: print(f"feature {k} with length: {len(calc_angles[k].squeeze())}\n")
         return None
 

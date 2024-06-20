@@ -123,7 +123,6 @@ def get_train_valid_test_sets(
     single_angle_debug: int = -1,  # Noise and return a single angle. -1 to disable, 1-3 for omega/theta/phi
     single_time_debug: bool = False,  # Noise and return a single time
     train_only: bool = False,
-    noise_mask: Optional[List[bool]] = None,
 ) -> Tuple[Dataset, Dataset, Dataset]:
     """
     Get the dataset objects to use for train/valid/test
@@ -192,7 +191,6 @@ def get_train_valid_test_sets(
             beta_schedule=variance_schedule,
             nonangular_variance=1.0,
             angular_variance=var_scale,
-            noise_mask=noise_mask,
         )
         for i, ds in enumerate(clean_dsets)
     ]
@@ -337,7 +335,6 @@ def train(
     ngpu: int = -1,  # -1 for all GPUs
     write_valid_preds: bool = False,  # Write validation predictions to disk at each epoch
     dryrun: bool = False,  # Disable some frills for a fast run to just train
-    noise_mask: Optional[List[bool]] = None,  # Mask out certain features from the noise and loss
 ):
     """Main training loop"""
     # Record the args given to the function before we create more vars
@@ -362,7 +359,6 @@ def train(
         exhaustive_t=exhaustive_validation_t,
         single_angle_debug=single_angle_debug,
         single_time_debug=single_timestep_debug,
-        noise_mask=noise_mask,
     )
     # Record the masked means in the output directory
     np.save(

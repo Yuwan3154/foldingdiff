@@ -15,7 +15,7 @@
     "dropout_p": 0.1,
     "decoder": "mlp",
     "gradient_clip": 1.0,
-    "lr": 3e-4,
+    "lr": 1e-3,
     "loss": "smooth_l1",
     "l2_norm": 0.0,
     "l1_norm": 0.0,
@@ -25,6 +25,6 @@
     "max_epochs": 10000,
     "early_stop_patience": 0,
     "use_swa": false,
-    "batch_size": 256,
+    "batch_size": 1024,
     "multithread": true
 }

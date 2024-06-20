@@ -13,6 +13,7 @@ import logging
 import math
 import functools
 from typing import *
+import numpy as np
 
 import torch
 from torch import nn
@@ -252,14 +253,14 @@ class BertForDiffusionBase(BertPreTrainedModel):
         self.config = config
         if self.config.is_decoder:
             raise NotImplementedError
-        self.ft_is_angular = ft_is_angular
+        self.ft_is_angular = torch.Tensor(ft_is_angular).bool()
         n_inputs = len(ft_is_angular)
         self.n_inputs = n_inputs
 
         if ft_names is not None:
-            self.ft_names = ft_names
+            self.ft_names = np.array(ft_names)
         else:
-            self.ft_names = [f"ft{i}" for i in range(n_inputs)]
+            self.ft_names = np.array([f"ft{i}" for i in range(n_inputs)])
         assert (
             len(self.ft_names) == n_inputs
         ), f"Got {len(self.ft_names)} names, expected {n_inputs}"
@@ -276,7 +277,7 @@ class BertForDiffusionBase(BertPreTrainedModel):
             assert noise_mask.shape[0] == self.n_inputs, f"Length of noise mask doesn't match number of features: {noise_mask.shape[0]} != {self.n_inputs}"
             self.noise_mask = noise_mask
         else:
-            self.noise_mask = torch.ones(self.n_inputs, dtype=torch.bool)
+            self.noise_mask = torch.ones(self.n_inputs).bool()
 
         self.n_outputs = self.noise_mask.count_nonzero().item()
         if decoder == "linear":
@@ -565,7 +566,7 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         Returns the loss terms for the model. Length of the returned list
         is equivalent to the number of features we are fitting to.
         """
-        known_noise = batch["known_noise"]
+        known_noise = batch["known_noise"][..., self.noise_mask]
         predicted_noise = self.forward(
             batch["corrupted"],
             batch["t"],
@@ -699,9 +700,9 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
             avg_loss += self.l1_lambda * l1_penalty
 
         pseudo_ft_names = (
-            (self.ft_names + ["pairwise_dist_loss"])
+            (self.ft_names[self.noise_mask] + ["pairwise_dist_loss"])
             if self.use_pairwise_dist_loss
-            else self.ft_names
+            else self.ft_names[self.noise_mask]
         )
         assert len(loss_terms) == len(pseudo_ft_names)
         loss_dict = {
@@ -743,9 +744,9 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
 
         # Log each of the loss terms
         pseudo_ft_names = (
-            (self.ft_names + ["pairwise_dist_loss"])
+            (self.ft_names[self.noise_mask] + ["pairwise_dist_loss"])
             if self.use_pairwise_dist_loss
-            else self.ft_names
+            else self.ft_names[self.noise_mask]
         )
         assert len(loss_terms) == len(pseudo_ft_names)
         loss_dict = {
