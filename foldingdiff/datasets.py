@@ -40,6 +40,7 @@ from foldingdiff import custom_metrics as cm
 from foldingdiff import utils
 
 TRIM_STRATEGIES = Literal["leftalign", "randomcrop", "discard"]
+AMINO_ACID_LIST = ['A', 'R', 'N', 'D', 'C', 'Q', 'E', 'G', 'H', 'I', 'L', 'K', 'M', 'F', 'P', 'S', 'T', 'W', 'Y', 'V', '-']
 
 FEATURE_SET_NAMES_TO_ANGULARITY = {
     "canonical": [False, False, False, True, True, True, True, True, True],
@@ -75,7 +76,6 @@ FEATURE_SET_NAMES_TO_FEATURE_NAMES = {
 FEATURE_SET_NAMES_TO_NOISE_MASK = {
     "canonical_full_angles_sequence": torch.Tensor([True, True, True, True, True, True] + [False for _ in range(len(AMINO_ACID_LIST))]).bool()
     }
-AMINO_ACID_LIST = ['A', 'R', 'N', 'D', 'C', 'Q', 'E', 'G', 'H', 'I', 'L', 'K', 'M', 'F', 'P', 'S', 'T', 'W', 'Y', 'V', '-']
 
 
 class CathCanonicalAnglesDataset(Dataset):
