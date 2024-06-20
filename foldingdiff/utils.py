@@ -149,6 +149,16 @@ def md5_all_py_files(dirname: str) -> str:
     return hash_md5.hexdigest()
 
 
+def md5_py_file(fname: str) -> str:
+    """Create a md5 sum for a single file"""
+    print(f"Computing md5 for {fname}")
+    hash_md5 = hashlib.md5()
+    with open(fname, "rb") as f:
+        for chunk in iter(lambda: f.read(2**20), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
+
+
 if __name__ == "__main__":
     import doctest
 

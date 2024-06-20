@@ -46,6 +46,7 @@ FEATURE_SET_NAMES_TO_ANGULARITY = {
     "canonical-full-angles": [True, True, True, True, True, True],
     "canonical-minimal-angles": [True, True, True, True],
     "cart-coords": [False, False, False],
+    "canonical-full-angles-sequence": np.array([True, True, True, True, True, True] + [False for _ in range(len(AMINO_ACID_LIST))]),
 }
 FEATURE_SET_NAMES_TO_FEATURE_NAMES = {
     "canonical": [
@@ -69,7 +70,11 @@ FEATURE_SET_NAMES_TO_FEATURE_NAMES = {
     ],
     "canonical-minimal-angles": ["phi", "psi", "omega", "tau"],
     "cart-coords": ["x", "y", "z"],
+    "canonical-full-angles-sequence": np.array(["phi", "psi", "omega", "tau", "CA:C:1N", "C:1N:1CA"] + AMINO_ACID_LIST),
 }
+FEATURE_SET_NAMES_TO_NOISE_MASK = {
+    "canonical_full_angles_sequence": torch.Tensor([True, True, True, True, True, True] + [False for _ in range(len(AMINO_ACID_LIST))]).bool()
+    }
 AMINO_ACID_LIST = ['A', 'R', 'N', 'D', 'C', 'Q', 'E', 'G', 'H', 'I', 'L', 'K', 'M', 'F', 'P', 'S', 'T', 'W', 'Y', 'V', '-']
 
 
@@ -100,8 +105,8 @@ class CathCanonicalAnglesDataset(Dataset):
     }
 
     noise_mask = {
-        "angles": [True, True, True, True, True, True, True, True, True] + [False for _ in range(len(AMINO_ACID_LIST))],
-        "coords": [True, True, True],
+        "angles": torch.Tensor([True, True, True, True, True, True, True, True, True] + [False for _ in range(len(AMINO_ACID_LIST))]).bool(),
+        "coords": torch.Tensor([True, True, True]).bool(),
     }
 
     def __init__(
@@ -132,8 +137,11 @@ class CathCanonicalAnglesDataset(Dataset):
         # self.structures should be a list of dicts with keys (angles, coords, fname)
         # Define as None by default; allow for easy checking later
         self.structures = None
-        codebase_hash = utils.md5_all_py_files(
-            os.path.dirname(os.path.abspath(__file__))
+        # codebase_hash = utils.md5_all_py_files(
+        #     os.path.dirname(os.path.abspath(__file__))
+        # )
+        codebase_hash = utils.md5_py_file(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "datasets.py")
         )
         # Default to false; assuming no cache, also doesn't match
         codebase_matches_hash = False
@@ -686,6 +694,62 @@ class AnglesEmptyDataset(Dataset):
     def __getitem__(self, index):
         raise NotImplementedError
 
+class AnglesEmptySequenceDataset(Dataset):
+    """
+    "Dataset" that doesn't actually contain any data. This is so that we can run sampling without needing to load
+    the actual data. Provides an API interface very similar to an actual dataset.
+    """
+
+    def __init__(
+        self,
+        feature_set_key: str,
+        pad: int = 9,
+        mean_offset: Optional[np.ndarray] = None,
+    ):
+        k = "coords" if feature_set_key == "cart-coords" else "angles"
+        self.feature_is_angular = {k: FEATURE_SET_NAMES_TO_ANGULARITY[feature_set_key]}
+        self.feature_names = {k: FEATURE_SET_NAMES_TO_FEATURE_NAMES[feature_set_key]}
+        self.noise_mask = {k: FEATURE_SET_NAMES_TO_NOISE_MASK[feature_set_key]}
+        assert len(self.feature_names[k]) == len(self.feature_is_angular[k])
+        logging.info(
+            f"Angularity definitions: {self.feature_is_angular} | {self.feature_names}"
+        )
+        self.pad = pad
+        self._mean_offset = mean_offset
+        if self._mean_offset is not None:
+            assert self._mean_offset.size == len(self.feature_names[k][self.noise_mask[k]])
+
+    @classmethod
+    def from_dir(cls, dirname: str):
+        """Initialize this dummy dataset from the given model dirname"""
+        training_args_json = os.path.join(dirname, "training_args.json")
+        assert os.path.isfile(training_args_json)
+        with open(training_args_json) as source:
+            training_args = json.load(source)
+
+        # Find the mean offset
+        mean_offset_file = os.path.join(dirname, "training_mean_offset.npy")
+        mean_offset = (
+            None if not os.path.isfile(mean_offset_file) else np.load(mean_offset_file)
+        )
+
+        return cls(
+            feature_set_key=training_args["angles_definitions"],
+            pad=training_args["max_seq_len"],
+            mean_offset=mean_offset,
+        )
+
+    def get_masked_means(self) -> np.ndarray:
+        """Implement the behavior of the actual dataset"""
+        if self._mean_offset is None:
+            raise NotImplementedError
+        return np.copy(self._mean_offset)
+
+    def __len__(self):
+        raise NotImplementedError
+
+    def __getitem__(self, index):
+        raise NotImplementedError
 
 class AutoregressiveCausalDataset(Dataset):
     """
