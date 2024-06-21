@@ -32,7 +32,7 @@ from transformers.optimization import get_linear_schedule_with_warmup
 from tqdm.auto import tqdm
 
 from foldingdiff import losses, nerf
-from foldingdiff.datasets import FEATURE_SET_NAMES_TO_ANGULARITY
+from foldingdiff.datasets import FEATURE_SET_NAMES_TO_ANGULARITY, FEATURE_SET_NAMES_TO_NOISE_MASK
 
 LR_SCHEDULE = Optional[Literal["OneCycleLR", "LinearWarmup"]]
 TIME_ENCODING = Literal["gaussian_fourier", "sinusoidal"]
@@ -272,6 +272,7 @@ class BertForDiffusionBase(BertPreTrainedModel):
         self.embeddings = BertEmbeddings(config)
         self.encoder = BertEncoder(config)
 
+        print(f"Using noise_mask: {noise_mask}")
         # Set up the network to project token representation to our outputs
         if noise_mask is not None:
             assert noise_mask.shape[0] == self.n_inputs, f"Length of noise mask doesn't match number of features: {noise_mask.shape[0]} != {self.n_inputs}"
@@ -280,6 +281,7 @@ class BertForDiffusionBase(BertPreTrainedModel):
             self.noise_mask = torch.ones(self.n_inputs).bool()
 
         self.n_outputs = self.noise_mask.count_nonzero().item()
+        print(f"Using {self.n_outputs} outputs")
         if decoder == "linear":
             self.token_decoder = nn.Linear(config.hidden_size, self.n_outputs)
         elif decoder == "mlp":
@@ -312,6 +314,7 @@ class BertForDiffusionBase(BertPreTrainedModel):
         idx: int = -1,
         best_by: Literal["train", "valid"] = "valid",
         copy_to: str = "",
+        noise_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         """
@@ -330,6 +333,13 @@ class BertForDiffusionBase(BertPreTrainedModel):
             ]
             logging.info(f"Auto constructed ft_is_angular: {ft_is_angular}")
 
+        if noise_mask is None:
+            print(FEATURE_SET_NAMES_TO_NOISE_MASK)
+            noise_mask = FEATURE_SET_NAMES_TO_NOISE_MASK[
+                train_args["angles_definitions"]
+            ]
+            logging.info(f"Auto constructed noise_mask: {noise_mask}")
+
         # Handles the case where we repurpose the time encoding for seq len encoding in the AR model
         time_encoding_key = (
             "time_encoding" if "time_encoding" in train_args else "seq_len_encoding"
@@ -339,6 +349,7 @@ class BertForDiffusionBase(BertPreTrainedModel):
             ft_is_angular=ft_is_angular,
             time_encoding=train_args[time_encoding_key],
             decoder=train_args["decoder"],
+            noise_mask=noise_mask,
             # lr=train_args["lr"],
             # loss=train_args["loss"],
             # l2=train_args["l2_norm"],

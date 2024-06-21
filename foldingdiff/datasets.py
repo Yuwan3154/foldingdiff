@@ -74,7 +74,7 @@ FEATURE_SET_NAMES_TO_FEATURE_NAMES = {
     "canonical-full-angles-sequence": np.array(["phi", "psi", "omega", "tau", "CA:C:1N", "C:1N:1CA"] + AMINO_ACID_LIST),
 }
 FEATURE_SET_NAMES_TO_NOISE_MASK = {
-    "canonical_full_angles_sequence": torch.Tensor([True, True, True, True, True, True] + [False for _ in range(len(AMINO_ACID_LIST))]).bool()
+    "canonical-full-angles-sequence": torch.Tensor([True, True, True, True, True, True] + [False for _ in range(len(AMINO_ACID_LIST))]).bool()
     }
 
 
@@ -534,7 +534,7 @@ class CathCanonicalAnglesSequenceDataset(CathCanonicalAnglesDataset):
         orig_features = super().feature_names["angles"].copy()
         self.feature_idx = torch.Tensor([
             orig_features.index(ft) for ft in self.feature_names["angles"]
-        ]).int()
+        ]).long()
         logging.info(
             f"CATH canonical angles sequence dataset with {self.feature_names['angles']} (subset idx {self.feature_idx})"
         )
