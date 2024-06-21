@@ -265,11 +265,122 @@ def sample_simple(
     return sampled_dfs
 
 
+@torch.no_grad()
+def seq_p_sample(
+    model: nn.Module,
+    x: torch.Tensor,
+    t: torch.Tensor,
+    seq_lens: Sequence[int],
+    betas: torch.Tensor,
+    n_outputs: int,
+) -> torch.Tensor:
+    """
+    Sample the given timestep. Note that this _may_ fall off the manifold if we just
+    feed the output back into itself repeatedly, so we need to perform modulo on it
+    (see p_sample_loop)
+    """
+    # Calculate alphas and betas
+    alpha_beta_values = beta_schedules.compute_alphas(betas)
+    sqrt_recip_alphas = 1.0 / torch.sqrt(alpha_beta_values["alphas"])
+
+    # Select based on time
+    t_unique = torch.unique(t)
+    assert len(t_unique) == 1, f"Got multiple values for t: {t_unique}"
+    t_index = t_unique.item()
+    sqrt_recip_alphas_t = sqrt_recip_alphas[t_index]
+    betas_t = betas[t_index]
+    sqrt_one_minus_alphas_cumprod_t = alpha_beta_values[
+        "sqrt_one_minus_alphas_cumprod"
+    ][t_index]
+
+    # Create the attention mask
+    attn_mask = torch.zeros(x.shape[:2], device=x.device)
+    for i, length in enumerate(seq_lens):
+        attn_mask[i, :length] = 1.0
+
+    # Equation 11 in the paper
+    # Use our model (noise predictor) to predict the mean
+    model_mean = sqrt_recip_alphas_t * (
+        x[..., :n_outputs]
+        - betas_t
+        * model(x, t, attention_mask=attn_mask)
+        / sqrt_one_minus_alphas_cumprod_t
+    )
+
+    if t_index == 0:
+        return model_mean
+    else:
+        posterior_variance_t = alpha_beta_values["posterior_variance"][t_index]
+        noise = torch.randn_like(x[..., :n_outputs])
+        # Algorithm 2 line 4:
+        return model_mean + torch.sqrt(posterior_variance_t) * noise
+
+
+@torch.no_grad()
+def seq_p_sample_loop(
+    model: nn.Module,
+    lengths: Sequence[int],
+    noise: torch.Tensor,
+    timesteps: int,
+    betas: torch.Tensor,
+    aa_seqs_encoded: torch.Tensor,
+    is_angle: Union[bool, List[bool]] = [True, True, True, True, True, True],
+    disable_pbar: bool = False,
+) -> torch.Tensor:
+    """
+    Returns a tensor of shape (timesteps, batch_size, seq_len, n_ft)
+    """
+    device = next(model.parameters()).device
+    b = noise.shape[0]
+    n_outputs = noise.shape[-1]
+    ft_set = noise.to(device)
+    aa_seqs_encoded = aa_seqs_encoded.to(device)
+    # Report metrics on starting noise
+    # amin and amax support reducing on multiple dimensions
+    logging.info(
+        f"Starting from noise {noise.shape} with angularity {is_angle} and range {torch.amin(ft_set, dim=(0, 1))} - {torch.amax(ft_set, dim=(0, 1))} using {device}"
+    )
+
+    ft_sets = []
+
+    for i in tqdm(
+        reversed(range(0, timesteps)),
+        desc="sampling loop time step",
+        total=timesteps,
+        disable=disable_pbar,
+    ):
+        ft_set = torch.cat((ft_set, aa_seqs_encoded), dim=2)
+        # Shape is (batch, seq_len, n_ft)
+        ft_set = seq_p_sample(
+            model=model,
+            x=ft_set,
+            t=torch.full((b,), i, device=device, dtype=torch.long),  # time vector
+            seq_lens=lengths,
+            betas=betas,
+            n_outputs=n_outputs,
+        )
+
+        # Wrap if angular
+        if isinstance(is_angle, bool):
+            if is_angle:
+                ft_set = utils.modulo_with_wrapped_range(
+                    ft_set, range_min=-torch.pi, range_max=torch.pi
+                )
+        else:
+            for j in range(ft_set.shape[-1]):
+                if is_angle[j]:
+                    ft_set[:, :, j] = utils.modulo_with_wrapped_range(
+                        ft_set[:, :, j], range_min=-torch.pi, range_max=torch.pi
+                    )
+        ft_sets.append(ft_set.cpu())
+    return torch.stack(ft_sets)
+
+
 def sample_fragment(
     model: nn.Module,
     train_dset: dsets.NoisedAnglesDataset,
-    n: int = 780,
-    sweep_lengths: Optional[Tuple[int, int]] = (9, 10),
+    aa_seqs: List[str],
+    n: int = 200,
     batch_size: int = 512,
     feature_key: str = "angles",
     disable_pbar: bool = False,
@@ -289,44 +400,43 @@ def sample_fragment(
     And optionally, sample_length()
     """
     # Process each batch
-    if sweep_lengths is not None:
-        sweep_min, sweep_max = sweep_lengths
-        if not sweep_min < sweep_max:
-            raise ValueError(
-                f"Minimum length {sweep_min} must be less than maximum {sweep_max}"
-            )
-        logging.info(
-            f"Sweeping from {sweep_min}-{sweep_max} with {n} examples at each length"
-        )
-        lengths = []
-        for l in range(sweep_min, sweep_max):
-            lengths.extend([l] * n)
-    else:
-        lengths = [train_dset.sample_length() for _ in range(n)]
+    print(aa_seqs, n)
+    lengths = [len(seq) for seq in aa_seqs for _ in range(n)]
+    length = np.unique(lengths)
+    assert length.shape[0] == 1, "All sequences must be the same length"
     lengths_chunkified = [
         lengths[i : i + batch_size] for i in range(0, len(lengths), batch_size)
     ]
+    encoder = OneHotEncoder(categories=[AMINO_ACID_LIST])
+    aa_seqs_encoded = encoder.fit_transform(np.array([aa_seq for aa_seq in aa_seqs for _ in range(n)]).reshape(-1, 1)).toarray()
+    aa_seqs_encoded_chunkified = [
+        aa_seqs_encoded[i : i + batch_size*length[0]] for i in range(0, len(aa_seqs_encoded), batch_size*length[0])
+    ]
+    n_outputs = train_dset.dset.noise_mask[train_dset.dset_key].count_nonzero().item()
 
     logging.info(f"Sampling {len(lengths)} items in batches of size {batch_size}")
     retval = []
-    for this_lengths in lengths_chunkified:
+    for this_lengths, this_aa_seqs_encoded in zip(lengths_chunkified, aa_seqs_encoded_chunkified):
         batch = len(this_lengths)
         # Sample noise and sample the lengths
         noise = train_dset.sample_noise(
-            torch.zeros((batch, train_dset.pad, model.n_inputs), dtype=torch.float32)
+            torch.zeros((batch, train_dset.pad, n_outputs), dtype=torch.float32)
         )
+        # Reshape the one-hot encoded amino acid sequence to be used as an input to the model
+        reshaped_aa_seqs_encoded = torch.tensor(this_aa_seqs_encoded.reshape(batch, train_dset.pad, -1)).float()
 
         # Trim things that are beyond the length of what we are generating
         if trim_to_length:
             noise = noise[:, : max(this_lengths), :]
 
         # Produces (timesteps, batch_size, seq_len, n_ft)
-        sampled = p_sample_loop(
+        sampled = seq_p_sample_loop(
             model=model,
             lengths=this_lengths,
             noise=noise,
             timesteps=train_dset.timesteps,
             betas=train_dset.alpha_beta_terms["betas"],
+            aa_seqs_encoded=reshaped_aa_seqs_encoded,
             is_angle=train_dset.feature_is_angular[feature_key],
             disable_pbar=disable_pbar,
         )
@@ -369,49 +479,23 @@ def load_model_and_dset(
     with open(model_dir / "training_args.json") as source:
         training_args = json.load(source)
     # Build args based on training args
-    if load_actual:
-        dset_args = dict(
+    mean_file = model_dir / "training_mean_offset.npy"
+    placeholder_dset = dsets.AnglesEmptySequenceDataset(
+        feature_set_key=training_args["angles_definitions"],
+        pad=training_args["max_seq_len"],
+        mean_offset=None if not mean_file.exists() else np.load(mean_file),
+    )
+    dummy_dset = dsets.NoisedAnglesDataset(
+            dset=placeholder_dset,
+            dset_key="coords"
+            if training_args["angles_definitions"] == "cart-coords"
+            else "angles",
             timesteps=training_args["timesteps"],
-            variance_schedule=training_args["variance_schedule"],
-            max_seq_len=training_args["max_seq_len"],
-            min_seq_len=training_args["min_seq_len"],
-            var_scale=training_args["variance_scale"],
-            syn_noiser=training_args["syn_noiser"],
-            exhaustive_t=training_args["exhaustive_validation_t"],
-            single_angle_debug=training_args["single_angle_debug"],
-            single_time_debug=training_args["single_timestep_debug"],
-            toy=training_args["subset"],
-            angles_definitions=training_args["angles_definitions"],
-            train_only=False,
+            exhaustive_t=False,
+            beta_schedule=training_args["variance_schedule"],
+            nonangular_variance=1.0,
+            angular_variance=training_args["variance_scale"],
         )
-
-        train_dset, valid_dset, test_dset = get_train_valid_test_sets(**dset_args)
-        logging.info(
-            f"Training dset contains features: {train_dset.feature_names} - angular {train_dset.feature_is_angular}"
-        )
-        return train_dset, valid_dset, test_dset
-    else:
-        mean_file = model_dir / "training_mean_offset.npy"
-        placeholder_dset = AnglesEmptyDataset(
-            feature_set_key=training_args["angles_definitions"],
-            pad=training_args["max_seq_len"],
-            mean_offset=None if not mean_file.exists() else np.load(mean_file),
-        )
-        noised_dsets = [
-            NoisedAnglesDataset(
-                dset=placeholder_dset,
-                dset_key="coords"
-                if training_args["angles_definitions"] == "cart-coords"
-                else "angles",
-                timesteps=training_args["timesteps"],
-                exhaustive_t=False,
-                beta_schedule=training_args["variance_schedule"],
-                nonangular_variance=1.0,
-                angular_variance=training_args["variance_scale"],
-            )
-            for _ in range(3)
-        ]
-        return noised_dsets
 
     return model, dummy_dset
 
