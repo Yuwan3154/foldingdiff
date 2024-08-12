@@ -41,9 +41,20 @@ def canonical_distances_and_dihedrals(
     assert os.path.isfile(fname)
     warnings.filterwarnings("ignore", ".*elements were guessed from atom_.*")
     warnings.filterwarnings("ignore", ".*invalid value encountered in true_div.*")
+    warnings.filterwarnings(
+    action='ignore', 
+    message='.*invalid value encountered in divide.*', 
+    category=RuntimeWarning, 
+    module='biotite.structure.util'
+    )
     opener = gzip.open if fname.endswith(".gz") else open
-    with opener(str(fname), "rt") as f:
-        source = PDBFile.read(f)
+    try:
+        with opener(str(fname), "rt") as f:
+            source = PDBFile.read(f)
+    except Exception as e:
+        logging.warning(f"Error reading {fname}: {e}")
+        return None
+
     if source.get_model_count() > 1:
         return None
     # Pull out the atomarray from atomarraystack

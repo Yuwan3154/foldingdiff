@@ -123,6 +123,7 @@ def get_train_valid_test_sets(
     single_angle_debug: int = -1,  # Noise and return a single angle. -1 to disable, 1-3 for omega/theta/phi
     single_time_debug: bool = False,  # Noise and return a single time
     train_only: bool = False,
+    shuffle: bool = False,
 ) -> Tuple[Dataset, Dataset, Dataset]:
     """
     Get the dataset objects to use for train/valid/test
@@ -139,6 +140,11 @@ def get_train_valid_test_sets(
         "canonical-minimal-angles": datasets.CathCanonicalMinimalAnglesDataset,
         "cart-coords": datasets.CathCanonicalCoordsDataset,
         "canonical-full-angles-sequence": datasets.CathCanonicalAnglesSequenceDataset,
+        "idealized-dihedral-secondary-structure-sequence": datasets.IdealizedDihedralSecondaryStructureSequenceDataset,
+        "idealized-dihedral-sequence": datasets.IdealizedDihedralSequenceDataset,
+        "fold-balanced-dihedral-sequence": datasets.FoldBalancedDihedralSequenceDataset,
+        "fold-balanced-dihedral": datasets.FoldBalancedDihedralDataset,
+        "fold-balanced-dihedral-secondary-structure-sequence": datasets.FoldBalancedDihedralSecondaryStructureSequenceDataset,
     }[angles_definitions]
     logging.info(f"Clean dataset class: {clean_dset_class}")
 
@@ -153,6 +159,7 @@ def get_train_valid_test_sets(
             trim_strategy=seq_trim_strategy,
             zero_center=False if angles_definitions == "cart-coords" else True,
             toy=toy,
+            shuffle=shuffle,
         )
         for s in splits
     ]
@@ -220,14 +227,14 @@ def build_callbacks(
             monitor="val_loss",
             dirpath=os.path.join(outdir, "models/best_by_valid"),
             save_top_k=5,
-            save_weights_only=True,
+            save_weights_only=False,
             mode="min",
         ),
         pl.callbacks.ModelCheckpoint(
             monitor="train_loss",
             dirpath=os.path.join(outdir, "models/best_by_train"),
             save_top_k=5,
-            save_weights_only=True,
+            save_weights_only=False,
             mode="min",
         ),
         pl.callbacks.LearningRateMonitor(logging_interval="epoch"),
@@ -257,9 +264,20 @@ def build_callbacks(
 def record_args_and_metadata(func_args: Dict[str, Any], results_folder: Path):
     # Create results directory
     if results_folder.exists():
-        logging.warning(f"Removing old results directory: {results_folder}")
+        print(f"Removing old results directory: {results_folder}")
         shutil.rmtree(results_folder)
     results_folder.mkdir(exist_ok=True)
+
+    # Set up logging
+    curr_time = datetime.now().strftime("%y%m%d_%H%M%S")
+    logging.basicConfig(
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler(results_folder / f"training_{curr_time}.log"),
+        logging.StreamHandler(),
+    ],
+    )
+
     with open(results_folder / "training_args.json", "w") as sink:
         logging.info(f"Writing training args to {sink.name}")
         json.dump(func_args, sink, indent=4)
@@ -335,6 +353,8 @@ def train(
     ngpu: int = -1,  # -1 for all GPUs
     write_valid_preds: bool = False,  # Write validation predictions to disk at each epoch
     dryrun: bool = False,  # Disable some frills for a fast run to just train
+    continue_from: Optional[str] = None,  # Continue training from a checkpoint
+    shuffle: bool = False,  # Shuffle the training data
 ):
     """Main training loop"""
     # Record the args given to the function before we create more vars
@@ -359,6 +379,7 @@ def train(
         exhaustive_t=exhaustive_validation_t,
         single_angle_debug=single_angle_debug,
         single_time_debug=single_timestep_debug,
+        shuffle=shuffle,
     )
     # Record the masked means in the output directory
     np.save(
@@ -496,6 +517,7 @@ def train(
         model=model,
         train_dataloaders=train_dataloader,
         val_dataloaders=valid_dataloader,
+        ckpt_path=continue_from,
     )
 
     # Plot the losses
@@ -545,6 +567,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--ngpu", type=int, default=-1, help="Number of GPUs to use (-1 for all)"
     )
     parser.add_argument("--dryrun", action="store_true", help="Dry run")
+    parser.add_argument("--continue_from", type=str, default=None, help="Continue from a checkpoint")
     return parser
 
 
@@ -567,19 +590,11 @@ def main():
             "cpu_only": args.cpu,
             "ngpu": args.ngpu,
             "dryrun": args.dryrun,
+            "continue_from": args.continue_from,
         },
     )
     train(**config_args)
 
 
 if __name__ == "__main__":
-    curr_time = datetime.now().strftime("%y%m%d_%H%M%S")
-    logging.basicConfig(
-        level=logging.INFO,
-        handlers=[
-            logging.FileHandler(f"training_{curr_time}.log"),
-            logging.StreamHandler(),
-        ],
-    )
-
     main()

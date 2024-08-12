@@ -208,9 +208,9 @@ def nerf_build_batch(
     phi: torch.Tensor,
     psi: torch.Tensor,
     omega: torch.Tensor,
-    bond_angle_n_ca_c: torch.Tensor,  # theta1
-    bond_angle_ca_c_n: torch.Tensor,  # theta2
-    bond_angle_c_n_ca: torch.Tensor,  # theta3
+    bond_angle_n_ca_c: torch.Tensor = 0,  # theta1
+    bond_angle_ca_c_n: torch.Tensor = 0,  # theta2
+    bond_angle_c_n_ca: torch.Tensor = 0,  # theta3
     bond_len_n_ca: Union[float, torch.Tensor] = N_CA_LENGTH,
     bond_len_ca_c: Union[float, torch.Tensor] = CA_C_LENGTH,
     bond_len_c_n: Union[float, torch.Tensor] = C_N_LENGTH,  # 0C:1N distance
@@ -225,71 +225,418 @@ def nerf_build_batch(
     assert phi.shape == psi.shape == omega.shape
     batch = phi.shape[0]
 
-    # (batch, seq, 3)
-    coords = (
-        torch.tensor(np.array([N_INIT, CA_INIT, C_INIT]), requires_grad=True)
-        .repeat(batch, 1, 1)
-        .to(phi.device)
-    )
-    assert coords.shape == (batch, 3, 3), f"Mismatched shape: {coords.shape}"
-
-    # perform broadcasting of bond lengths
-    ensure_tensor = (
-        lambda x: torch.tensor(x, requires_grad=False).expand(phi.shape)
-        if isinstance(x, float)
-        else x
-    )
-    bond_len_n_ca = ensure_tensor(bond_len_n_ca)
-    bond_len_ca_c = ensure_tensor(bond_len_ca_c)
-    bond_len_c_n = ensure_tensor(bond_len_c_n)
-
-    phi = phi[:, 1:]
-    psi = psi[:, :-1]
-    omega = omega[:, :-1]
-    assert phi.shape == psi.shape == omega.shape
-
-    for i in range(phi.shape[1]):
-        # Place the C-N
-        n_coord = place_dihedral(
-            coords[:, -3, :],  # after indexing, shape is (batch, 3)
-            coords[:, -2, :],
-            coords[:, -1, :],
-            bond_angle=bond_angle_ca_c_n[:, i].unsqueeze(1),
-            bond_length=bond_len_c_n[:, i].unsqueeze(1),
-            torsion_angle=psi[:, i].unsqueeze(1),
-            use_torch=True,
-        )
-
-        # Place the N-CA
-        ca_coord = place_dihedral(
-            coords[:, -2, :],
-            coords[:, -1, :],
-            n_coord,
-            bond_angle=bond_angle_c_n_ca[:, i].unsqueeze(1),
-            bond_length=bond_len_n_ca[:, i].unsqueeze(1),
-            torsion_angle=omega[:, i].unsqueeze(1),
-            use_torch=True,
-        )
-
-        # Place the CA-C
-        c_coord = place_dihedral(
-            coords[:, -1, :],
-            n_coord,
-            ca_coord,
-            bond_angle=bond_angle_n_ca_c[:, i].unsqueeze(1),
-            bond_length=bond_len_ca_c[:, i].unsqueeze(1),
-            torsion_angle=phi[:, i].unsqueeze(1),
-            use_torch=True,
-        )
-
-        # coordinates have shape (batch, 3) --> (batch, 1, 3)
-        coords = torch.cat(
-            [coords, n_coord.unsqueeze(1), ca_coord.unsqueeze(1), c_coord.unsqueeze(1)],
-            dim=1,
-        )
-        assert coords.shape[-1] == 3 and coords.shape[0] == batch
+    # Use Sergey's code instead of the original implementation
+    batch_dih = torch.stack([phi, psi, omega], dim=-1)
+    
+    # The returned shape is (batch, length, atoms=(N,CA,C,CB,O), coords=(x,y,z))
+    coords = dih_to_coord(batch_dih, add_ob=False, requires_grad=True)
+    # Reshape to (batch, length * 3, 3)
+    coords = coords.reshape(batch, -1, 3)
 
     return coords
+
+    # # (batch, seq, 3)
+    # coords = (
+    #     torch.tensor(np.array([N_INIT, CA_INIT, C_INIT]), requires_grad=True)
+    #     .repeat(batch, 1, 1)
+    #     .to(phi.device)
+    # )
+    # assert coords.shape == (batch, 3, 3), f"Mismatched shape: {coords.shape}"
+
+    # # perform broadcasting of bond lengths
+    # ensure_tensor = (
+    #     lambda x: torch.tensor(x, requires_grad=False).expand(phi.shape)
+    #     if isinstance(x, float)
+    #     else x
+    # )
+    # bond_len_n_ca = ensure_tensor(bond_len_n_ca)
+    # bond_len_ca_c = ensure_tensor(bond_len_ca_c)
+    # bond_len_c_n = ensure_tensor(bond_len_c_n)
+
+    # phi = phi[:, 1:]
+    # psi = psi[:, :-1]
+    # omega = omega[:, :-1]
+    # assert phi.shape == psi.shape == omega.shape
+
+    # for i in range(phi.shape[1]):
+    #     # Place the C-N
+    #     n_coord = place_dihedral(
+    #         coords[:, -3, :],  # after indexing, shape is (batch, 3)
+    #         coords[:, -2, :],
+    #         coords[:, -1, :],
+    #         bond_angle=bond_angle_ca_c_n[:, i].unsqueeze(1),
+    #         bond_length=bond_len_c_n[:, i].unsqueeze(1),
+    #         torsion_angle=psi[:, i].unsqueeze(1),
+    #         use_torch=True,
+    #     )
+
+    #     # Place the N-CA
+    #     ca_coord = place_dihedral(
+    #         coords[:, -2, :],
+    #         coords[:, -1, :],
+    #         n_coord,
+    #         bond_angle=bond_angle_c_n_ca[:, i].unsqueeze(1),
+    #         bond_length=bond_len_n_ca[:, i].unsqueeze(1),
+    #         torsion_angle=omega[:, i].unsqueeze(1),
+    #         use_torch=True,
+    #     )
+
+    #     # Place the CA-C
+    #     c_coord = place_dihedral(
+    #         coords[:, -1, :],
+    #         n_coord,
+    #         ca_coord,
+    #         bond_angle=bond_angle_n_ca_c[:, i].unsqueeze(1),
+    #         bond_length=bond_len_ca_c[:, i].unsqueeze(1),
+    #         torsion_angle=phi[:, i].unsqueeze(1),
+    #         use_torch=True,
+    #     )
+
+    #     # coordinates have shape (batch, 3) --> (batch, 1, 3)
+    #     coords = torch.cat(
+    #         [coords, n_coord.unsqueeze(1), ca_coord.unsqueeze(1), c_coord.unsqueeze(1)],
+    #         dim=1,
+    #     )
+    #     assert coords.shape[-1] == 3 and coords.shape[0] == batch
+
+    # return coords
+
+
+# Code adapted from Sergey Ovchinnikov
+def to_len(a, b):
+    """
+    ====================================================================
+    Given coordinates a-b, return length or distance.
+    ====================================================================
+    """
+    return torch.sqrt(torch.sum((a - b) ** 2, dim=-1) + 1e-8)
+
+
+def to_ang(a, b, c):
+    """
+    ====================================================================
+    Given coordinates a-b-c, return angle.
+    ====================================================================
+    """
+    N = lambda x: torch.sqrt(torch.sum(x ** 2, dim=-1) + 1e-8)
+    ba = b - a
+    bc = b - c
+    ang = torch.acos(torch.sum(ba * bc, dim=-1) / (N(ba) * N(bc)))
+    return ang
+
+
+def to_dih(a, b, c, d):
+    """
+    ====================================================================
+    Given coordinates a-b-c-d, return dihedral.
+    ====================================================================
+    """
+    D = lambda x, y: torch.sum(x * y, dim=-1)
+    N = lambda x: torch.nn.functional.normalize(x, dim=-1)
+    bc = N(b - c)
+    n1 = torch.cross(N(a - b), bc)
+    n2 = torch.cross(bc, N(c - d))
+    x = D(n1, n2)
+    y = D(torch.cross(n1, bc), n2)
+    dih = torch.atan2(y, x)
+    return dih
+
+
+def coord_to_dih(coord):
+    """
+    ====================================================================
+    Given coordinates (N,CA,C), return dihedrals (phi,psi,omega).
+    
+    input:  (batch,length,atoms=(N,CA,C),coords=(x,y,z))
+    output: (batch,length,dihedrals=(phi,psi,omega))
+    ====================================================================
+    """
+    batch_size = coord.shape[0]
+    length = coord.shape[1]
+    
+    X = coord[:, :, :3].reshape(batch_size, -1, 3)
+    a, b, c, d = X[:, :-3], X[:, 1:-2], X[:, 2:-1], X[:, 3:]
+    dih = to_dih(a, b, c, d)
+    
+    # add zero (psi) at start
+    # add zero (phi,omega) at end
+    # reshape to (batch,length,(phi,psi,omega))
+    dih = torch.nn.functional.pad(dih, (1, 2))
+    dih = dih.reshape(batch_size, -1, 3)
+    return dih
+
+
+def extend(a, b, c, L, A, D):
+    """
+    =================================================================
+    input:  3 coords (a,b,c), (L)ength, (A)ngle, and (D)ihedral
+    output: 4th coord
+    =================================================================
+    ref: https://doi.org/10.1002/jcc.20237
+    =================================================================
+    """
+    N = lambda x: torch.nn.functional.normalize(x, dim=-1)
+    bc = N(b-c)
+    n = N(torch.cross(N(b-a), bc))
+    m = [bc, torch.cross(n, bc), n]
+    d = [L * torch.cos(A), L * torch.sin(A) * torch.cos(D), -L * torch.sin(A) * torch.sin(D)]
+    return c + sum([m[i] * d[i] for i in range(3)])
+
+
+def residue_extend(phi, psi, omg, c0, n1, a1, add_ob=True):
+    """
+    ===============================================================
+    input:   c(i-1), n(i),   ca(i)
+    output:  c(i),   n(i+1), ca(i+1)
+    ===============================================================
+                     [b1]
+                      |
+   (c0-n1-a1) ->  c0-[n1-a1-c1]-n2-a2 -> (c1-n2-a2)
+                         |
+                        [o1]
+    ===============================================================
+    """
+    c1 = extend(c0, n1, a1, torch.tensor(1.523, dtype=torch.float32), torch.tensor(1.941, dtype=torch.float32), phi)
+    n2 = extend(n1, a1, c1, torch.tensor(1.329, dtype=torch.float32), torch.tensor(2.028, dtype=torch.float32), psi)
+    a2 = extend(a1, c1, n2, torch.tensor(1.458, dtype=torch.float32), torch.tensor(2.124, dtype=torch.float32), omg)
+    coord = [n1, a1, c1]
+    if add_ob:
+        b = extend(c1, n1, a1, torch.tensor(1.522, dtype=torch.float32), torch.tensor(1.927, dtype=torch.float32), torch.tensor(-2.143, dtype=torch.float32))
+        o = extend(n2, a1, c1, torch.tensor(1.231, dtype=torch.float32), torch.tensor(2.108, dtype=torch.float32), torch.tensor(-3.142, dtype=torch.float32))
+        coord += [b, o]
+    return c1, n2, a2, coord
+
+
+def dih_to_coord(dih, add_ob=True, return_raw=False, requires_grad=True):
+    """
+    =================================================================
+    input:  (batch, length, dihedrals=(phi,psi,omega))
+    output: (batch, length, atoms=(N,CA,C,CB,O), coords=(x,y,z))
+    =================================================================
+    """
+    # transpose (batch,len,dih) -> (len,dih,batch,1)
+    dih = dih.permute(1, 2, 0).unsqueeze(-1)
+    batch_size = dih.shape[2]
+    length = dih.shape[0]
+
+    cn = torch.tensor(1.329, dtype=torch.float32)
+    na = torch.tensor(1.458, dtype=torch.float32)
+    cna = torch.tensor(2.124, dtype=torch.float32)
+    ini_coords = [
+        torch.tensor([0, 0, 0], dtype=torch.float32).to(dih.device).requires_grad_(requires_grad),
+        torch.tensor([cn, 0, 0], dtype=torch.float32).to(dih.device).requires_grad_(requires_grad),
+        torch.tensor([cn - na * torch.cos(cna), na * torch.sin(cna), 0], dtype=torch.float32).to(dih.device).requires_grad_(requires_grad)
+    ]
+    ini_coords = [ini.expand(batch_size, 3) for ini in ini_coords]
+
+    coords = []
+    c0, n1, a1 = ini_coords
+    for dh in dih:
+        c1, n2, a2, coord = residue_extend(dh[0], dh[1], dh[2], c0, n1, a1, add_ob=add_ob)
+        c0, n1, a1 = c1, n2, a2
+        coords.append(torch.stack(coord))
+
+    coords = torch.stack(coords)
+
+    if return_raw:
+        return c0, n1, a1, coords
+    else:
+        coords = coords.permute(2, 0, 1, 3)
+        return coords
+
+
+def idealize(coords, gap_unmask, opt_iter=5000, add_ob=True, lr=0.001):
+    '''
+    ===================================================================
+    input:  (batch, length, atoms=(N,CA,C), coords=(x,y,z))
+    
+    output: (batch, length, dihedrals=(phi,psi,omega))
+            (batch, length, atoms=(N,CA,C), coords=(x,y,z))
+    ===================================================================
+    '''
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if gap_unmask is None:
+        gap_unmask = torch.ones(coords.shape[:2], dtype=torch.bool)
+    else:
+        assert gap_unmask.shape == coords.shape[:2]
+
+    coords = coords.clone().to(device).detach().requires_grad_(True)
+    init_coords = coords.clone().to(device).detach().requires_grad_(False)
+    gap_unmask = gap_unmask.to(device).detach().requires_grad_(False)
+
+    # Mask to ignore NaN values in the loss computation
+    mask = ~(coords == 0).any(dim=-1).any(dim=-1)
+    optimizer = torch.optim.Adam([coords], lr=lr)
+    for k in range(opt_iter):
+        optimizer.zero_grad()
+
+        n, a, c = coords[:, :, 0], coords[:, :, 1], coords[:, :, 2]
+        # Bond lengths
+        n_a = (((1.458 - to_len(n, a)[mask])**2)).mean()
+        a_c = (((1.523 - to_len(a, c)[mask])**2)).mean()
+        c_n = ((((1.329 - to_len(c[:, :-1], n[:, 1:]))[gap_unmask[:, 1:]])**2)).mean()
+
+        # Bond angles
+        n_a_c = (((1.941 - to_ang(n, a, c)[mask])**2)).mean()
+        a_c_n = (((2.028 - to_ang(a[:, :-1], c[:, :-1], n[:, 1:])[gap_unmask[:, 1:]])**2)).mean()
+        c_n_a = (((2.124 - to_ang(c[:, :-1], n[:, 1:], a[:, 1:])[gap_unmask[:, 1:]])**2)).mean()
+
+        # Setup idealization loss function
+        loss_ideal = n_a + a_c + c_n + n_a_c + a_c_n + c_n_a
+
+        # RMS to initial coordinates
+        loss_ms = ((coords[mask] - init_coords[mask])**2).mean()
+        loss = loss_ideal + loss_ms
+        loss.backward()
+        optimizer.step()
+
+        # # Debug information
+        # if k % 50 == 0:
+        #     print(f"Iteration {k+1}")
+        #     print(f"loss_ideal: {loss_ideal.item()}, loss_ms: {loss_ms.item()}")
+        #     print(f"coords grad norm: {coords.grad.norm().item()}")
+        #     ideal_xyz = dih_to_coord(coord_to_dih(coords), add_ob=add_ob)
+        #     dm_x = torch.sqrt(torch.sum((init_coords[:, None, :, :3] - init_coords[:, :, None, :3]) ** 2, dim=-1) + 1e-8)
+        #     dm_y = torch.sqrt(torch.sum((ideal_xyz[:, None, :, :3] - ideal_xyz[:, :, None, :3]) ** 2, dim=-1) + 1e-8)
+        #     rms = torch.sqrt(torch.mean((dm_x - dm_y) ** 2, dim=(1,2,3)))
+        #     print(f"Iteration {k+1}, RMS: {rms.item()}")
+
+    ideal_dih = coord_to_dih(coords)
+    ideal_xyz = dih_to_coord(ideal_dih, add_ob=add_ob)
+    return ideal_dih.detach().cpu().numpy(), ideal_xyz.detach().cpu().numpy()
+
+
+def extract_backbone_coords_with_gaps(pdb_fname, backbone_atoms=['N','CA','C','CB','O'], chain_id=None):
+    """
+    Output the coordinates of the backbone atoms and the gaps between residues with
+    shape: (residues, atoms, coords=(x,y,z))
+    """
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure("structure", pdb_fname)
+    chain_id = os.path.basename(pdb_fname)[4] if chain_id is None else chain_id
+
+    coords = []
+    gaps = []
+    residues = []
+    resi_ids = []
+    model = structure[0] # Taking the first model; alternatively skip this pdb file
+    for chain in model:
+        if chain.get_id() == chain_id or chain_id == "0":
+            prev_residue_id = None
+            for residue in chain:
+                if all([atom in residue for atom in backbone_atoms]):
+                    atoms_coord = [residue[atom].get_coord() for atom in backbone_atoms]
+                    coords.append(atoms_coord)
+                    residues.append(residue.get_resname())
+                    current_residue_id = residue.get_id()[1]
+                    resi_ids.append(str(current_residue_id))
+                    current_residue_id = residue_id_to_ordinal(current_residue_id) if isinstance(current_residue_id, str) else current_residue_id
+                    if prev_residue_id is None:
+                        gaps.append(True)  # First residue, no gap before it
+                    else:
+                        gaps.append(current_residue_id == prev_residue_id + 1 or current_residue_id == prev_residue_id) # <= to handle 1A, 1, 2, 3 cases
+                        # # Debug print statements to inspect gaps
+                        # if chain_gaps[-1] == False:
+                        #     print("Current id:", residue.get_id()[1])
+                        #     print(f"Gap detected between {prev_residue_id} and {current_residue_id}")
+                    prev_residue_id = current_residue_id
+
+    coords_tensor = torch.from_numpy(np.array(coords))
+    gaps_tensor = torch.tensor(gaps, dtype=torch.bool)
+
+    return coords_tensor, gaps_tensor, residues, chain_id, resi_ids
+    
+
+def load_PDB(x, ln=None, atoms=["N", "CA", "C", "CB", "O"]):
+    '''
+    ===================================================================
+    input:  x = PDB filename
+            ln = length (optional)
+            atoms = atoms to extract (optional)
+            
+    output: (batch, length, atoms, coords=(x,y,z))
+    ===================================================================
+    '''
+    n, xyz, models = {}, {}, []
+
+    def model_append():
+        if len(n) > 0 and max(n.values()) > 0:
+            max_length = max(n.values())
+            for atom in atoms:
+                while n[atom] < max_length:
+                    xyz[atom].append([np.nan, np.nan, np.nan])
+                    n[atom] += 1
+            model = [xyz[atom] for atom in atoms]
+            models.append(model)
+            if ln is not None:
+                for atom in atoms:
+                    while n[atom] < ln:
+                        xyz[atom].append([np.nan, np.nan, np.nan])
+                        n[atom] += 1
+        for atom in atoms:
+            n[atom], xyz[atom] = 0, []
+
+    model_append()
+
+    for line in open(x, "r"):
+        line = line.rstrip()
+        if line[:5] == "MODEL":
+            model_append()
+        if line[:4] == "ATOM":
+            atom = line[12:16].strip()
+            resi = line[17:20]
+            resn = int(line[22:26]) - 1
+            x_coord = float(line[30:38])
+            y_coord = float(line[38:46])
+            z_coord = float(line[46:54])
+            if atom in atoms:
+                while n[atom] < resn:
+                    xyz[atom].append([np.nan, np.nan, np.nan])
+                    n[atom] += 1
+                if n[atom] == resn:
+                    xyz[atom].append([x_coord, y_coord, z_coord])
+                    n[atom] += 1
+
+    model_append()
+
+    # Debug print statements to inspect shapes and content
+    for i, model in enumerate(models):
+        print(f"Model {i} lengths: {[len(model[atom]) for atom in range(len(atoms))]}")
+    print(f"Final models shape: {[len(model) for model in models]}")
+
+    # Convert models list to numpy array
+    np_models = np.array(models)
+    print(f"np_models shape before transpose: {np_models.shape}")
+
+    return np_models.transpose(0, 2, 1, 3)
+
+
+def save_PDB(coords, residues, chain_id, resi_ids, pdb_out, atoms=["N", "CA", "C", "CB", "O"]):
+    '''
+    ===================================================================
+    input: (batch, length, atoms=(N, CA, C, CB, O), coords=(x, y, z))
+    ===================================================================
+    '''
+    num_models = coords.shape[0]
+    out = open(pdb_out, "w")
+    k = 1
+    for m, model in enumerate(coords):
+        if num_models > 1:
+            out.write("MODEL    %5d\n" % (m + 1))
+        for r, residue in enumerate(model[:len(residues)]):
+            res_name = residues[r]
+            res_id = resi_ids[r]
+            for a, atom in enumerate(residue):
+                x, y, z = atom
+                if not np.isnan(x):
+                    out.write(
+                        "ATOM  %5d  %-2s  %3s %s%4s    %8.3f%8.3f%8.3f  %4.2f  %4.2f\n"
+                        % (k, atoms[a], res_name, chain_id, res_id, x, y, z, 1.00, 0.00)
+                    )
+                k += 1
+        if num_models > 1:
+            out.write("ENDMDL\n")
+    out.close()
 
 
 def main():

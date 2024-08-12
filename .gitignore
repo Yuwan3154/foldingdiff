@@ -1,8 +1,13 @@
 # User-added files
 .vscode/*
 *.pkl
-data/cath/*
+data/cath
 data/alphafold/*.pdb.gz
+data/cath_af
+data/cath-b_extra_full_pdb
+data/genie_afdb
+data/vall.jul19.2011.torsions
+results
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

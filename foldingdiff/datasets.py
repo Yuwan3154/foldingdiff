@@ -8,6 +8,7 @@ import pickle
 import hashlib
 import functools
 import multiprocessing
+import threading
 import os
 import glob
 import logging
@@ -16,10 +17,14 @@ from typing import *
 
 from matplotlib import pyplot as plt
 import numpy as np
+import pandas as pd
+from sklearn.preprocessing import OneHotEncoder
+from concurrent.futures import ThreadPoolExecutor
+import tqdm
 
 import torch
 from torch import nn
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 
 LOCAL_DATA_DIR = Path(
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
@@ -27,7 +32,10 @@ LOCAL_DATA_DIR = Path(
 
 CATH_DIR = LOCAL_DATA_DIR / "cath"
 ALPHAFOLD_DIR = LOCAL_DATA_DIR / "alphafold"
-
+ROSETTA_DIR = LOCAL_DATA_DIR / "vall.jul19.2011.torsions"
+CATH_DIHEDRAL_CSV_PATH = LOCAL_DATA_DIR / Path("cath") / Path("cath-b-s35-newest_processed.csv")
+CATH_AF_DIR = LOCAL_DATA_DIR / Path("cath_af")
+CATH_AF_DIHEDRAL_CSV_PATH = LOCAL_DATA_DIR / Path("cath_af") / Path("cath-v4_3_0.alphafold-v2.2022-11-22_processed.csv")
 
 from foldingdiff import beta_schedules
 from foldingdiff.angles_and_coords import (
@@ -41,13 +49,19 @@ from foldingdiff import utils
 
 TRIM_STRATEGIES = Literal["leftalign", "randomcrop", "discard"]
 AMINO_ACID_LIST = ['A', 'R', 'N', 'D', 'C', 'Q', 'E', 'G', 'H', 'I', 'L', 'K', 'M', 'F', 'P', 'S', 'T', 'W', 'Y', 'V', '-']
+SECONDARY_STRUCTURE_LIST = ['ss_H', 'ss_E', 'ss_L']
 
 FEATURE_SET_NAMES_TO_ANGULARITY = {
     "canonical": [False, False, False, True, True, True, True, True, True],
     "canonical-full-angles": [True, True, True, True, True, True],
     "canonical-minimal-angles": [True, True, True, True],
     "cart-coords": [False, False, False],
-    "canonical-full-angles-sequence": np.array([True, True, True, True, True, True] + [False for _ in range(len(AMINO_ACID_LIST))]),
+    "canonical-full-angles-sequence": np.array([True, True, True] + [False for _ in range(len(AMINO_ACID_LIST))]),
+    "idealized-dihedral-sequence": np.array([True, True, True] + [False for _ in range(len(AMINO_ACID_LIST))]),
+    "idealized-dihedral-secondary-structure-sequence": np.array([True, True, True] + [False for _ in range(len(SECONDARY_STRUCTURE_LIST))] + [False for _ in range(len(AMINO_ACID_LIST))]),
+    "fold-balanced-dihedral-sequence": np.array([True, True, True] + [False for _ in range(len(AMINO_ACID_LIST))]),
+    "fold-balanced-dihedral": np.array([True, True, True]),
+    "fold-balanced-dihedral-secondary-structure-sequence": np.array([True, True, True] + [False for _ in range(len(SECONDARY_STRUCTURE_LIST))] + [False for _ in range(len(AMINO_ACID_LIST))]),
 }
 FEATURE_SET_NAMES_TO_FEATURE_NAMES = {
     "canonical": [
@@ -71,10 +85,839 @@ FEATURE_SET_NAMES_TO_FEATURE_NAMES = {
     ],
     "canonical-minimal-angles": ["phi", "psi", "omega", "tau"],
     "cart-coords": ["x", "y", "z"],
-    "canonical-full-angles-sequence": np.array(["phi", "psi", "omega", "tau", "CA:C:1N", "C:1N:1CA"] + AMINO_ACID_LIST),
+    "canonical-full-angles-sequence": np.array(["phi", "psi", "omega"] + AMINO_ACID_LIST),
+    "idealized-dihedral-sequence": np.array(["phi", "psi", "omega"] + AMINO_ACID_LIST),
+    "idealized-dihedral-secondary-structure-sequence": np.array(["phi", "psi", "omega"] + SECONDARY_STRUCTURE_LIST + AMINO_ACID_LIST),
+    "fold-balanced-dihedral-sequence": np.array(["phi", "psi", "omega"] + AMINO_ACID_LIST),
+    "fold-balanced-dihedral": np.array(["phi", "psi", "omega"]),
+    "fold-balanced-dihedral-secondary-structure-sequence": np.array(["phi", "psi", "omega"] + SECONDARY_STRUCTURE_LIST + AMINO_ACID_LIST),
 }
 FEATURE_SET_NAMES_TO_NOISE_MASK = {
-    "canonical-full-angles-sequence": torch.Tensor([True, True, True, True, True, True] + [False for _ in range(len(AMINO_ACID_LIST))]).bool()
+    "canonical-full-angles-sequence": torch.Tensor([True, True, True] + [False for _ in range(len(AMINO_ACID_LIST))]).bool(),
+    "idealized-dihedral-sequence": torch.Tensor([True, True, True] + [False for _ in range(len(AMINO_ACID_LIST))]).bool(),
+    "idealized-dihedral-secondary-structure-sequence": torch.Tensor([True, True, True] + [True for _ in range(len(SECONDARY_STRUCTURE_LIST))] + [False for _ in range(len(AMINO_ACID_LIST))]).bool(),
+    "fold-balanced-dihedral-sequence": torch.Tensor([True, True, True] + [False for _ in range(len(AMINO_ACID_LIST))]).bool(),
+    "fold-balanced-dihedral": torch.Tensor([True, True, True]).bool(),
+    "fold-balanced-dihedral-secondary-structure-sequence": torch.Tensor([True, True, True] + [True for _ in range(len(SECONDARY_STRUCTURE_LIST))] + [False for _ in range(len(AMINO_ACID_LIST))]).bool(),
+    }
+
+
+class IdealizedDihedralSecondaryStructureSequenceDataset(Dataset):
+    """
+    Load in the dataset.
+
+    All angles should be given between [-pi, pi]
+    """
+
+    feature_names = {
+        "angles": [
+            "phi",
+            "psi",
+            "omega",
+        ] + SECONDARY_STRUCTURE_LIST + AMINO_ACID_LIST,
+    }
+    feature_is_angular = {
+        "angles": torch.Tensor([True, True, True] + [False for _ in range(len(SECONDARY_STRUCTURE_LIST))] + [False for _ in range(len(AMINO_ACID_LIST))]).bool(),
+    }
+
+    noise_mask = {
+        "angles": torch.Tensor([True, True, True] + [True for _ in range(len(SECONDARY_STRUCTURE_LIST))] + [False for _ in range(len(AMINO_ACID_LIST))]).bool(),
+    }
+
+    def __init__(
+        self,
+        pdbs: Union[
+            Literal["cath", "alphafold", "rosetta"], str
+        ] = "rosetta",  # Keyword or a directory
+        split: Optional[Literal["train", "test", "validation"]] = None,
+        pad: int = 9,
+        min_length: int = 0,  # Set to 0 to disable
+        trim_strategy: TRIM_STRATEGIES = "randomcrop",
+        toy: int = 0,
+        zero_center: bool = True,  # Center the features to have 0 mean
+        use_cache: bool = True,  # Use/build cached computations of dihedrals and angles
+        cache_dir: Path = Path(os.path.dirname(os.path.abspath(__file__))),
+        shuffle: bool = False,
+    ) -> None:
+        super().__init__()
+        assert pad > min_length
+        self.trim_strategy = trim_strategy
+        self.pad = pad
+        self.min_length = min_length
+
+        if pdbs == "rosetta":
+            self.data_file = ROSETTA_DIR
+        else:
+            raise ValueError("Only rosetta dataset is supported")
+
+        # self.structures should be a list of dicts with keys (angles)
+        # Define as None by default; allow for easy checking later
+        self.data = pd.read_csv(self.data_file)
+        self.valid_indices = np.where(self.data["valid"].values)[0]
+        self.data = self.data.loc[:, self.feature_names["angles"]]
+        self.structures = [{"angles": self.data.iloc[i:i+self.pad]} for i in self.valid_indices]
+
+        # If specified, remove sequences shorter than min_length
+        if self.min_length:
+            orig_len = len(self.structures)
+            self.structures = [
+                s for s in self.structures if s["angles"].shape[0] >= self.min_length
+            ]
+            len_delta = orig_len - len(self.structures)
+            logging.info(
+                f"Removing structures shorter than {self.min_length} residues excludes {len_delta}/{orig_len} --> {len(self.structures)} sequences"
+            )
+        if self.trim_strategy == "discard":
+            orig_len = len(self.structures)
+            self.structures = [
+                s for s in self.structures if s["angles"].shape[0] <= self.pad
+            ]
+            len_delta = orig_len - len(self.structures)
+            logging.info(
+                f"Removing structures longer than {self.pad} produces {orig_len} - {len_delta} = {len(self.structures)} sequences"
+            )
+
+        # Split the dataset if requested. This is implemented here to maintain
+        # functional parity with the original CATH dataset. Original CATH uses
+        # a 80/10/10 split
+        # Shuffle the sequences so contiguous splits acts like random splits
+        self.rng = np.random.default_rng(seed=6489)
+        # self.rng.shuffle(self.structures)
+
+        if split is not None:
+            split_idx = int(len(self.structures) * 0.8)
+            if split == "train":
+                self.structures = self.structures[:split_idx]
+            elif split == "validation":
+                self.structures = self.structures[
+                    split_idx : split_idx + int(len(self.structures) * 0.1)
+                ]
+            elif split == "test":
+                self.structures = self.structures[
+                    split_idx + int(len(self.structures) * 0.1) :
+                ]
+            else:
+                raise ValueError(f"Unknown split: {split}")
+
+            logging.info(f"Split {split} contains {len(self.structures)} structures")
+
+        # if given, zero center the features
+        self.means = None
+        if zero_center:
+            # Note that these angles are not yet padded
+            structures_concat = np.concatenate([s["angles"] for s in self.structures])
+            assert structures_concat.ndim == 2
+            self.means = cm.wrapped_mean(structures_concat, axis=0)
+            assert self.means.shape == (structures_concat.shape[1],)
+            # Zero out the means for non-noised features (i.e. amino acid sequence)
+            self.means[~self.feature_is_angular["angles"]] = 0.0
+            # Subtract the mean and perform modulo where values are radial
+            logging.info(
+                f"Offsetting features {self.feature_names['angles']} by means {self.means}"
+            )
+
+        # Aggregate lengths
+        self.all_lengths = [s["angles"].shape[0] for s in self.structures]
+        self._length_rng = np.random.default_rng(seed=6489)
+        logging.info(
+            f"Length of angles: {np.min(self.all_lengths)}-{np.max(self.all_lengths)}, mean {np.mean(self.all_lengths)}"
+        )
+
+    @property
+    def filenames(self) -> List[str]:
+        """Return the filenames that constitute this dataset"""
+        return [str(self.data_file), ""]
+
+    def sample_length(self, n: int = 1) -> Union[int, List[int]]:
+        """
+        Sample a observed length of a sequence
+        """
+        assert n > 0
+        if n == 1:
+            l = self._length_rng.choice(self.all_lengths)
+        else:
+            l = self._length_rng.choice(self.all_lengths, size=n, replace=True).tolist()
+        return l
+
+    def get_masked_means(self) -> np.ndarray:
+        """Return the means subset to the actual features used"""
+        if self.means is None:
+            return None
+        return np.copy(self.means[self.noise_mask["angles"]])
+
+    def __len__(self) -> int:
+        return len(self.structures)
+
+    def __getitem__(
+        self, index, ignore_zero_center: bool = False
+    ) -> Dict[str, torch.Tensor]:
+        if not 0 <= index < len(self):
+            raise IndexError("Index out of range")
+
+        angles = self.structures[index]["angles"]
+
+        # If given, offset the angles with mean
+        if self.means is not None and not ignore_zero_center:
+            assert (
+                self.means.shape[0] == angles.shape[1]
+            ), f"Mismatched shapes for mean offset: {self.means.shape} != {angles.shape}"
+            angles = angles - self.means
+
+            angular_idx = np.where(self.feature_is_angular["angles"])[0]
+            angles.iloc[:, angular_idx] = utils.modulo_with_wrapped_range(
+                angles.iloc[:, angular_idx], -np.pi, np.pi
+            )
+
+        # Subset angles to ones we are actaully using as features
+        angles = angles.loc[
+            :, self.feature_names["angles"]
+        ].values
+        assert angles is not None
+        assert angles.shape[1] == len(
+            self.feature_is_angular["angles"]
+        ), f"Mismatched shapes for angles: {angles.shape[1]} != {len(self.feature_is_angular['angles'])}"
+
+        # Replace nan values with zero
+        np.nan_to_num(angles, copy=False, nan=0)
+
+        # Create attention mask. 0 indicates masked
+        l = min(self.pad, angles.shape[0])
+        attn_mask = torch.zeros(size=(self.pad,))
+        attn_mask[:l] = 1.0
+
+        # Additionally, mask out positions that are nan
+        # is_nan = np.where(np.any(np.isnan(angles), axis=1))[0]
+        # attn_mask[is_nan] = 0.0  # Mask out the nan positions
+
+        # Perform padding/trimming
+        if angles.shape[0] < self.pad:
+            angles = np.pad(
+                angles,
+                ((0, self.pad - angles.shape[0]), (0, 0)),
+                mode="constant",
+                constant_values=0,
+            )
+            angles[self.pad - angles.shape[0]:, -1] = 1 # Pad the one-hot encoded amino acid
+            coords = np.pad(
+                coords,
+                ((0, self.pad - coords.shape[0]), (0, 0)),
+                mode="constant",
+                constant_values=0,
+            )
+        elif angles.shape[0] > self.pad:
+            if self.trim_strategy == "leftalign":
+                angles = angles[: self.pad]
+                coords = coords[: self.pad]
+            elif self.trim_strategy == "randomcrop":
+                # Randomly crop the sequence to
+                start_idx = self.rng.integers(0, angles.shape[0] - self.pad)
+                end_idx = start_idx + self.pad
+                assert end_idx < angles.shape[0]
+                angles = angles[start_idx:end_idx]
+                coords = coords[start_idx:end_idx]
+                assert angles.shape[0] == coords.shape[0] == self.pad
+            else:
+                raise ValueError(f"Unknown trim strategy: {self.trim_strategy}")
+
+        # Create position IDs
+        position_ids = torch.arange(start=0, end=self.pad, step=1, dtype=torch.long)
+
+        angular_idx = np.where(self.feature_is_angular["angles"])[
+            0
+        ]
+        # assert utils.tolerant_comparison_check(
+        #     angles[:, angular_idx], ">=", -np.pi
+        # ), f"Illegal value: {np.min(angles[:, angular_idx])}"
+        # assert utils.tolerant_comparison_check(
+        #     angles[:, angular_idx], "<=", np.pi
+        # ), f"Illegal value: {np.max(angles[:, angular_idx])}"
+        angles = torch.from_numpy(angles).float()
+
+        retval = {
+            "angles": angles,
+            "attn_mask": attn_mask,
+            "position_ids": position_ids,
+            "lengths": torch.tensor(l, dtype=torch.int64),
+        }
+        return retval
+
+    def get_feature_mean_var(self, ft_name: str) -> Tuple[float, float]:
+        """
+        Return the mean and variance associated with a given feature
+        """
+        assert ft_name in self.feature_names["angles"], f"Unknown feature {ft_name}"
+        idx = self.feature_names["angles"].index(ft_name)
+        logging.info(f"Computing metrics for {ft_name} - idx {idx}")
+
+        all_vals = []
+        for i in range(len(self)):
+            item = self[i]
+            attn_idx = torch.where(item["attn_mask"] == 1.0)[0]
+            vals = item["angles"][attn_idx, idx]
+            all_vals.append(vals)
+        all_vals = torch.cat(all_vals)
+        assert all_vals.ndim == 1
+        return torch.var_mean(all_vals)[::-1]  # Default is (var, mean)
+
+
+class IdealizedDihedralSequenceDataset(Dataset):
+    """
+    Load in the dataset.
+
+    All angles should be given between [-pi, pi]
+    """
+
+    feature_names = {
+        "angles": [
+            "phi",
+            "psi",
+            "omega",
+        ] + AMINO_ACID_LIST,
+    }
+    feature_is_angular = {
+        "angles": torch.Tensor([True, True, True] + [False for _ in range(len(AMINO_ACID_LIST))]).bool(),
+    }
+
+    noise_mask = {
+        "angles": torch.Tensor([True, True, True] + [False for _ in range(len(AMINO_ACID_LIST))]).bool(),
+    }
+
+    def __init__(
+        self,
+        pdbs: Union[
+            Literal["cath", "alphafold", "rosetta"], str
+        ] = "rosetta",  # Keyword or a directory
+        split: Optional[Literal["train", "test", "validation"]] = None,
+        pad: int = 9,
+        min_length: int = 0,  # Set to 0 to disable
+        trim_strategy: TRIM_STRATEGIES = "randomcrop",
+        toy: int = 0,
+        zero_center: bool = True,  # Center the features to have 0 mean
+        use_cache: bool = True,  # Use/build cached computations of dihedrals and angles
+        cache_dir: Path = Path(os.path.dirname(os.path.abspath(__file__))),
+        shuffle: bool = False,
+    ) -> None:
+        super().__init__()
+        assert pad > min_length
+        self.trim_strategy = trim_strategy
+        self.pad = pad
+        self.min_length = min_length
+
+        if pdbs == "rosetta":
+            self.data_file = ROSETTA_DIR
+        else:
+            raise ValueError("Only rosetta dataset is supported")
+
+        # self.structures should be a list of dicts with keys (angles)
+        # Define as None by default; allow for easy checking later
+        self.data = pd.read_csv(self.data_file)
+        self.valid_indices = np.where(self.data["valid"].values)[0]
+        self.data = self.data.loc[:, self.feature_names["angles"]]
+        self.structures = [{"angles": self.data.iloc[i:i+self.pad]} for i in self.valid_indices]
+
+        # If specified, remove sequences shorter than min_length
+        if self.min_length:
+            orig_len = len(self.structures)
+            self.structures = [
+                s for s in self.structures if s["angles"].shape[0] >= self.min_length
+            ]
+            len_delta = orig_len - len(self.structures)
+            logging.info(
+                f"Removing structures shorter than {self.min_length} residues excludes {len_delta}/{orig_len} --> {len(self.structures)} sequences"
+            )
+        if self.trim_strategy == "discard":
+            orig_len = len(self.structures)
+            self.structures = [
+                s for s in self.structures if s["angles"].shape[0] <= self.pad
+            ]
+            len_delta = orig_len - len(self.structures)
+            logging.info(
+                f"Removing structures longer than {self.pad} produces {orig_len} - {len_delta} = {len(self.structures)} sequences"
+            )
+
+        # Split the dataset if requested. This is implemented here to maintain
+        # functional parity with the original CATH dataset. Original CATH uses
+        # a 80/10/10 split
+        # Shuffle the sequences so contiguous splits acts like random splits
+        self.rng = np.random.default_rng(seed=6489)
+        # self.rng.shuffle(self.structures)
+
+        if split is not None:
+            split_idx = int(len(self.structures) * 0.8)
+            if split == "train":
+                self.structures = self.structures[:split_idx]
+            elif split == "validation":
+                self.structures = self.structures[
+                    split_idx : split_idx + int(len(self.structures) * 0.1)
+                ]
+            elif split == "test":
+                self.structures = self.structures[
+                    split_idx + int(len(self.structures) * 0.1) :
+                ]
+            else:
+                raise ValueError(f"Unknown split: {split}")
+
+            logging.info(f"Split {split} contains {len(self.structures)} structures")
+
+        # if given, zero center the features
+        self.means = None
+        if zero_center:
+            # Note that these angles are not yet padded
+            structures_concat = np.concatenate([s["angles"] for s in self.structures])
+            assert structures_concat.ndim == 2
+            self.means = cm.wrapped_mean(structures_concat, axis=0)
+            assert self.means.shape == (structures_concat.shape[1],)
+            # Zero out the means for non-noised features (i.e. amino acid sequence)
+            self.means[~self.feature_is_angular["angles"]] = 0.0
+            # Subtract the mean and perform modulo where values are radial
+            logging.info(
+                f"Offsetting features {self.feature_names['angles']} by means {self.means}"
+            )
+
+        # Aggregate lengths
+        self.all_lengths = [s["angles"].shape[0] for s in self.structures]
+        self._length_rng = np.random.default_rng(seed=6489)
+        logging.info(
+            f"Length of angles: {np.min(self.all_lengths)}-{np.max(self.all_lengths)}, mean {np.mean(self.all_lengths)}"
+        )
+
+    @property
+    def filenames(self) -> List[str]:
+        """Return the filenames that constitute this dataset"""
+        return [str(self.data_file), ""]
+
+    def sample_length(self, n: int = 1) -> Union[int, List[int]]:
+        """
+        Sample a observed length of a sequence
+        """
+        assert n > 0
+        if n == 1:
+            l = self._length_rng.choice(self.all_lengths)
+        else:
+            l = self._length_rng.choice(self.all_lengths, size=n, replace=True).tolist()
+        return l
+
+    def get_masked_means(self) -> np.ndarray:
+        """Return the means subset to the actual features used"""
+        if self.means is None:
+            return None
+        return np.copy(self.means[self.noise_mask["angles"]])
+
+    def __len__(self) -> int:
+        return len(self.structures)
+
+    def __getitem__(
+        self, index, ignore_zero_center: bool = False
+    ) -> Dict[str, torch.Tensor]:
+        if not 0 <= index < len(self):
+            raise IndexError("Index out of range")
+
+        angles = self.structures[index]["angles"]
+
+        # If given, offset the angles with mean
+        if self.means is not None and not ignore_zero_center:
+            assert (
+                self.means.shape[0] == angles.shape[1]
+            ), f"Mismatched shapes for mean offset: {self.means.shape} != {angles.shape}"
+            angles = angles - self.means
+
+            angular_idx = np.where(self.feature_is_angular["angles"])[0]
+            angles.iloc[:, angular_idx] = utils.modulo_with_wrapped_range(
+                angles.iloc[:, angular_idx], -np.pi, np.pi
+            )
+
+        # Subset angles to ones we are actaully using as features
+        angles = angles.loc[
+            :, self.feature_names["angles"]
+        ].values
+        assert angles is not None
+        assert angles.shape[1] == len(
+            self.feature_is_angular["angles"]
+        ), f"Mismatched shapes for angles: {angles.shape[1]} != {len(self.feature_is_angular['angles'])}"
+
+        # Replace nan values with zero
+        np.nan_to_num(angles, copy=False, nan=0)
+
+        # Create attention mask. 0 indicates masked
+        l = min(self.pad, angles.shape[0])
+        attn_mask = torch.zeros(size=(self.pad,))
+        attn_mask[:l] = 1.0
+
+        # Additionally, mask out positions that are nan
+        # is_nan = np.where(np.any(np.isnan(angles), axis=1))[0]
+        # attn_mask[is_nan] = 0.0  # Mask out the nan positions
+
+        # Perform padding/trimming
+        if angles.shape[0] < self.pad:
+            angles = np.pad(
+                angles,
+                ((0, self.pad - angles.shape[0]), (0, 0)),
+                mode="constant",
+                constant_values=0,
+            )
+            angles[self.pad - angles.shape[0]:, -1] = 1 # Pad the one-hot encoded amino acid
+            coords = np.pad(
+                coords,
+                ((0, self.pad - coords.shape[0]), (0, 0)),
+                mode="constant",
+                constant_values=0,
+            )
+        elif angles.shape[0] > self.pad:
+            if self.trim_strategy == "leftalign":
+                angles = angles[: self.pad]
+                coords = coords[: self.pad]
+            elif self.trim_strategy == "randomcrop":
+                # Randomly crop the sequence to
+                start_idx = self.rng.integers(0, angles.shape[0] - self.pad)
+                end_idx = start_idx + self.pad
+                assert end_idx < angles.shape[0]
+                angles = angles[start_idx:end_idx]
+                coords = coords[start_idx:end_idx]
+                assert angles.shape[0] == coords.shape[0] == self.pad
+            else:
+                raise ValueError(f"Unknown trim strategy: {self.trim_strategy}")
+
+        # Create position IDs
+        position_ids = torch.arange(start=0, end=self.pad, step=1, dtype=torch.long)
+
+        angles = torch.from_numpy(angles).float()
+
+        retval = {
+            "angles": angles,
+            "attn_mask": attn_mask,
+            "position_ids": position_ids,
+            "lengths": torch.tensor(l, dtype=torch.int64),
+        }
+        return retval
+
+    def get_feature_mean_var(self, ft_name: str) -> Tuple[float, float]:
+        """
+        Return the mean and variance associated with a given feature
+        """
+        assert ft_name in self.feature_names["angles"], f"Unknown feature {ft_name}"
+        idx = self.feature_names["angles"].index(ft_name)
+        logging.info(f"Computing metrics for {ft_name} - idx {idx}")
+
+        all_vals = []
+        for i in range(len(self)):
+            item = self[i]
+            attn_idx = torch.where(item["attn_mask"] == 1.0)[0]
+            vals = item["angles"][attn_idx, idx]
+            all_vals.append(vals)
+        all_vals = torch.cat(all_vals)
+        assert all_vals.ndim == 1
+        return torch.var_mean(all_vals)[::-1]  # Default is (var, mean)
+
+
+class FoldBalancedDihedralSequenceDataset(Dataset):
+    """
+    Load in the dataset.
+
+    All angles should be given between [-pi, pi]
+    """
+
+    feature_names = {
+        "angles": [
+            "phi",
+            "psi",
+            "omega",
+        ] + AMINO_ACID_LIST,
+    }
+    feature_is_angular = {
+        "angles": torch.Tensor([True, True, True] + [False for _ in range(len(AMINO_ACID_LIST))]).bool(),
+    }
+    noise_mask = {
+        "angles": torch.Tensor([True, True, True] + [False for _ in range(len(AMINO_ACID_LIST))]).bool(),
+    }
+
+    def __init__(
+        self,
+        pdbs: Union[
+            Literal["cath_idealized", "cath_af_idealized"], str
+        ] = "cath_af_idealized",  # Keyword or a directory
+        split: Optional[Literal["train", "test", "validation"]] = None,
+        pad: int = 9,
+        min_length: int = 0,  # Set to 0 to disable
+        trim_strategy: TRIM_STRATEGIES = "randomcrop",
+        toy: int = 0,
+        zero_center: bool = True,  # Center the features to have 0 mean
+        use_cache: bool = True,  # Use/build cached computations of dihedrals and angles
+        cache_dir: Path = Path(os.path.dirname(os.path.abspath(__file__))),
+        shuffle: bool = False,
+    ) -> None:
+        super().__init__()
+        assert pad > min_length
+        self.trim_strategy = trim_strategy
+        self.pad = pad
+        self.min_length = min_length
+        self.shuffle = shuffle
+
+        if pdbs == "cath_idealized":
+            self.data_file = CATH_DIHEDRAL_CSV_PATH
+            self.dihedral_path = CATH_DIR / Path("dihedrals")
+            self.summary_data = pd.read_csv(CATH_DIHEDRAL_CSV_PATH)
+            self.summary_data["Path"] = self.summary_data.apply(lambda x: os.path.join(self.dihedral_path, x["Domain"]), axis=1)
+        elif pdbs == "cath_af_idealized":
+            self.data_file = CATH_AF_DIHEDRAL_CSV_PATH
+            self.dihedral_path = CATH_AF_DIR / Path("dihedrals")
+            self.summary_data = pd.read_csv(CATH_AF_DIHEDRAL_CSV_PATH)
+            self.summary_data["Path"] = self.summary_data.apply(lambda x: os.path.join(self.dihedral_path, x["Superfamily"], x["Domain"]), axis=1)
+            self.structures = pickle.load(open(self.dihedral_path / Path("data.pkl"), "rb"))
+        else:
+            raise ValueError(f"{pdbs} dataset is not supported")
+
+        # self.structures should be a list of dicts with keys (angles)
+        # Define as None by default; allow for easy checking later
+        self.summary_data = self.summary_data[self.summary_data["Valid"]]
+        self.folds = self.summary_data["Topology"].value_counts().index
+
+        # Split the dataset if requested. This is implemented here to maintain
+        # functional parity with the original CATH dataset. Original CATH uses
+        # a 80/10/10 split
+        # Shuffle the sequences so contiguous splits acts like random splits
+        # TODO: Decide how to split the folds
+        self.rng = np.random.default_rng(seed=6489)
+        if self.shuffle:
+            self.rng.shuffle(self.folds)
+
+
+        if split is not None:
+            split_idx = int(len(self.folds) * 0.8)
+            if split == "train":
+                self.folds = self.folds[:split_idx]
+                self.length_multiplier = 100
+            elif split == "validation":
+                self.folds = self.folds[
+                    split_idx : split_idx + int(len(self.folds) * 0.1)
+                ]
+                self.length_multiplier = 10
+            elif split == "test":
+                self.folds = self.folds[
+                    split_idx + int(len(self.folds) * 0.1) :
+                ]
+                self.length_multiplier = 1
+            else:
+                raise ValueError(f"Unknown split: {split}")
+
+            logging.info(f"Split {split} contains folds: {self.folds} ")
+            self.summary_data = self.summary_data[self.summary_data["Topology"].isin(self.folds)]
+            # Pop folds that are not in the split
+            self.structures = {fold: self.structures[fold] for fold in self.folds}
+
+        # # Store the structures in a dictionary with key being the fold number
+        # self.structures = self.__compute_featurization(self.folds, self.summary_data)
+
+        # if given, zero center the features
+        self.means = None
+        if zero_center:
+            # Note that these angles are not yet padded
+            structures_concat = np.concatenate([s[0].loc[:, self.feature_names["angles"]] for fold in self.structures.values() for s in fold.values()])
+            assert structures_concat.ndim == 2
+            self.means = cm.wrapped_mean(structures_concat, axis=0)
+            assert self.means.shape == (structures_concat.shape[1],)
+            # Zero out the means for non-noised features (i.e. amino acid sequence)
+            self.means[~self.feature_is_angular["angles"]] = 0.0
+            # Subtract the mean and perform modulo where values are radial
+            logging.info(
+                f"Offsetting features {self.feature_names['angles']} by means {self.means}"
+            )
+
+        # Aggregate lengths
+        self.all_lengths = [s[0].shape[0] for fold in self.structures.values() for s in fold.values()]
+        self._length_rng = np.random.default_rng(seed=6489)
+        logging.info(
+            f"Length of angles: {np.min(self.all_lengths)}-{np.max(self.all_lengths)}, mean {np.mean(self.all_lengths)}"
+        )
+
+    @property
+    def filenames(self) -> List[str]:
+        """Return the filenames that constitute this dataset"""
+        return [str(self.data_file), ""]
+
+    def sample_length(self, n: int = 1) -> Union[int, List[int]]:
+        """
+        Sample a observed length of a sequence
+        """
+        assert n > 0
+        if n == 1:
+            l = self._length_rng.choice(self.all_lengths)
+        else:
+            l = self._length_rng.choice(self.all_lengths, size=n, replace=True).tolist()
+        return l
+
+    def get_masked_means(self) -> np.ndarray:
+        """Return the means subset to the actual features used"""
+        if self.means is None:
+            return None
+        return np.copy(self.means[self.noise_mask["angles"]])
+
+    # Not used
+    def __compute_featurization(self, folds, summary_data) -> Dict[str, List[Dict[str, torch.Tensor]]]:
+        
+        def process_row(
+            row, summary_data, structures, lock
+        ):
+            fold = row["Topology"]
+            cur_structure = pd.read_csv(row["Path"])
+            cur_valid_indices = np.where(cur_structure["valid"].values)[0]
+            cur_structure = cur_structure.loc[:, self.feature_names["angles"]]
+            cur_structure = [{"angles": cur_structure.iloc[i:i+self.pad]} for i in cur_valid_indices]
+            
+            with lock:
+                structures[fold].extend(cur_structure)
+        
+        structures = {fold: [] for fold in folds}
+        lock = threading.Lock()
+        with ThreadPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
+            futures = [executor.submit(process_row, row, summary_data, structures, lock) for _, row in summary_data.iterrows()]
+            for future in tqdm.tqdm(futures, total=len(futures), desc="Processing structures"):
+                future.result()  # Wait for all futures to complete
+
+        return structures
+
+    def __len__(self) -> int:
+        return len(self.folds) * self.length_multiplier
+
+    def __getitem__(
+        self, index, ignore_zero_center: bool = False
+    ) -> Dict[str, torch.Tensor]:
+        if not 0 <= index < len(self):
+            raise IndexError("Index out of range")
+
+        index = index % len(self.folds)
+        fold = self.folds[index]
+        fold_structures = self.structures[fold]
+        domain = self.rng.choice(list(fold_structures.keys()))
+        strucutre, valid_indices = fold_structures[domain]
+        valid_index = self.rng.choice(valid_indices)
+        angles = strucutre.iloc[valid_index:valid_index+self.pad].loc[:, self.feature_names["angles"]]
+
+        # If given, offset the angles with mean
+        if self.means is not None and not ignore_zero_center:
+            assert (
+                self.means.shape[0] == angles.shape[1]
+            ), f"Mismatched shapes for mean offset: {self.means.shape} != {angles.shape}"
+            angles = angles - self.means
+
+            angular_idx = np.where(self.feature_is_angular["angles"])[0]
+            angles.iloc[:, angular_idx] = utils.modulo_with_wrapped_range(
+                angles.iloc[:, angular_idx], -np.pi, np.pi
+            )
+
+        # Subset angles to ones we are actaully using as features
+        angles = angles.values
+        assert angles is not None
+        assert angles.shape[1] == len(
+            self.feature_is_angular["angles"]
+        ), f"Mismatched shapes for angles: {angles.shape[1]} != {len(self.feature_is_angular['angles'])}"
+
+        # Replace nan values with zero
+        np.nan_to_num(angles, copy=False, nan=0)
+
+        # Create attention mask. 0 indicates masked
+        l = min(self.pad, angles.shape[0])
+        attn_mask = torch.zeros(size=(self.pad,))
+        attn_mask[:l] = 1.0
+
+        # Additionally, mask out positions that are nan
+        # is_nan = np.where(np.any(np.isnan(angles), axis=1))[0]
+        # attn_mask[is_nan] = 0.0  # Mask out the nan positions
+
+        # Perform padding/trimming
+        if angles.shape[0] < self.pad:
+            angles = np.pad(
+                angles,
+                ((0, self.pad - angles.shape[0]), (0, 0)),
+                mode="constant",
+                constant_values=0,
+            )
+            angles[self.pad - angles.shape[0]:, -1] = 1 # Pad the one-hot encoded amino acid
+        elif angles.shape[0] > self.pad:
+            if self.trim_strategy == "leftalign":
+                angles = angles[: self.pad]
+            elif self.trim_strategy == "randomcrop":
+                # Randomly crop the sequence to
+                start_idx = self.rng.integers(0, angles.shape[0] - self.pad + 1)
+                end_idx = start_idx + self.pad
+                assert end_idx < angles.shape[0]
+                angles = angles[start_idx:end_idx]
+                assert angles.shape[0] == self.pad
+            else:
+                raise ValueError(f"Unknown trim strategy: {self.trim_strategy}")
+
+        # Create position IDs
+        position_ids = torch.arange(start=0, end=self.pad, step=1, dtype=torch.long)
+
+        angles = torch.from_numpy(angles).float()
+
+        retval = {
+            "angles": angles,
+            "attn_mask": attn_mask,
+            "position_ids": position_ids,
+            "lengths": torch.tensor(l, dtype=torch.int64),
+        }
+        return retval
+
+    def get_feature_mean_var(self, ft_name: str) -> Tuple[float, float]:
+        """
+        Return the mean and variance associated with a given feature
+        """
+        assert ft_name in self.feature_names["angles"], f"Unknown feature {ft_name}"
+        idx = self.feature_names["angles"].index(ft_name)
+        logging.info(f"Computing metrics for {ft_name} - idx {idx}")
+
+        all_vals = []
+        for i in range(len(self)):
+            item = self[i]
+            attn_idx = torch.where(item["attn_mask"] == 1.0)[0]
+            vals = item["angles"][attn_idx, idx]
+            all_vals.append(vals)
+        all_vals = torch.cat(all_vals)
+        assert all_vals.ndim == 1
+        return torch.var_mean(all_vals)[::-1]  # Default is (var, mean)
+
+
+class FoldBalancedDihedralDataset(FoldBalancedDihedralSequenceDataset):
+    """
+    Load in the dataset.
+
+    All angles should be given between [-pi, pi]
+    """
+
+    feature_names = {
+        "angles": [
+            "phi",
+            "psi",
+            "omega",
+        ],
+    }
+    feature_is_angular = {
+        "angles": torch.Tensor([True, True, True]).bool(),
+    }
+    noise_mask = {
+        "angles": torch.Tensor([True, True, True]).bool(),
+    }
+
+
+class FoldBalancedDihedralSecondaryStructureSequenceDataset(FoldBalancedDihedralSequenceDataset):
+    """
+    Load in the dataset.
+
+    All angles should be given between [-pi, pi]
+    """
+
+    feature_names = {
+        "angles": [
+            "phi",
+            "psi",
+            "omega",
+        ] + SECONDARY_STRUCTURE_LIST + AMINO_ACID_LIST,
+    }
+    feature_is_angular = {
+        "angles": torch.Tensor([True, True, True] + [False for _ in range(len(SECONDARY_STRUCTURE_LIST))] + [False for _ in range(len(AMINO_ACID_LIST))]).bool(),
+    }
+    noise_mask = {
+        "angles": torch.Tensor([True, True, True] + [True for _ in range(len(SECONDARY_STRUCTURE_LIST))] + [False for _ in range(len(AMINO_ACID_LIST))]).bool(),
     }
 
 
@@ -100,8 +943,8 @@ class CathCanonicalAnglesDataset(Dataset):
         "coords": ["x", "y", "z"],
     }
     feature_is_angular = {
-        "angles": [False, False, False, True, True, True, True, True, True] + [False for _ in range(len(AMINO_ACID_LIST))],
-        "coords": [False, False, False],
+        "angles": torch.Tensor([False, False, False, True, True, True, True, True, True] + [False for _ in range(len(AMINO_ACID_LIST))]).bool(),
+        "coords": torch.Tensor([False, False, False]).bool(),
     }
 
     noise_mask = {
@@ -112,7 +955,7 @@ class CathCanonicalAnglesDataset(Dataset):
     def __init__(
         self,
         pdbs: Union[
-            Literal["cath", "alphafold"], str
+            Literal["cath", "alphafold", "cath_idealized", "cath_af_idealized"], str
         ] = "cath",  # Keyword or a directory
         split: Optional[Literal["train", "test", "validation"]] = None,
         pad: int = 512,
@@ -122,6 +965,7 @@ class CathCanonicalAnglesDataset(Dataset):
         zero_center: bool = True,  # Center the features to have 0 mean
         use_cache: bool = True,  # Use/build cached computations of dihedrals and angles
         cache_dir: Path = Path(os.path.dirname(os.path.abspath(__file__))),
+        shuffle: bool = False,
     ) -> None:
         super().__init__()
         assert pad > min_length
@@ -228,10 +1072,10 @@ class CathCanonicalAnglesDataset(Dataset):
             self.means = cm.wrapped_mean(structures_concat, axis=0)
             assert self.means.shape == (structures_concat.shape[1],)
             # Zero out the means for non-noised features (i.e. amino acid sequence)
-            self.means[~CathCanonicalAnglesDataset.noise_mask["angles"]] = 0.0
+            self.means[~CathCanonicalAnglesDataset.feature_is_angular["angles"]] = 0.0
             # Subtract the mean and perform modulo where values are radial
             logging.info(
-                f"Offsetting features {self.feature_names['angles']} by means {self.means}"
+                f"Offsetting features {CathCanonicalAnglesDataset.feature_names['angles']} by means {self.means}"
             )
 
         # Aggregate lengths
@@ -249,7 +1093,7 @@ class CathCanonicalAnglesDataset(Dataset):
         #     logging.info(f"Feature {ft} mean, var: {m}, {v}")
 
     def __get_pdb_fnames(
-        self, pdbs: Union[Literal["cath", "alphafold"], str, List[str], Tuple[str]]
+        self, pdbs: Union[Literal["cath", "alphafold", "cath_idealized", "cath_af_idealized"], str, List[str], Tuple[str]]
     ) -> List[str]:
         """Return a list of filenames for PDB structures making up this dataset"""
         if isinstance(pdbs, (list, tuple)):
@@ -268,9 +1112,18 @@ class CathCanonicalAnglesDataset(Dataset):
             if pdbs == "cath":
                 fnames = glob.glob(os.path.join(CATH_DIR, "dompdb", "*"))
                 assert fnames, f"No files found in {CATH_DIR}/dompdb"
+            elif pdbs == "cath_idealized":
+                fnames = glob.glob(os.path.join(CATH_DIR, "idealized", "*"))
+                assert fnames, f"No files found in {CATH_DIR}/idealized"
             elif pdbs == "alphafold":
                 fnames = glob.glob(os.path.join(ALPHAFOLD_DIR, "*.pdb.gz"))
                 assert fnames, f"No files found in {ALPHAFOLD_DIR}"
+            elif pdbs == "cath_af_idealized":
+                dirs = glob.glob(os.path.join(CATH_AF_DIR, "idealized", "*"))
+                fnames = []
+                for d in dirs:
+                    fnames.extend(glob.glob(os.path.join(d, "*")))
+                assert fnames, f"No files found in {CATH_AF_DIR}/idealized"
             else:
                 raise ValueError(f"Unknown pdb set: {pdbs}")
 
@@ -457,9 +1310,7 @@ class CathCanonicalAnglesDataset(Dataset):
         # Create position IDs
         position_ids = torch.arange(start=0, end=self.pad, step=1, dtype=torch.long)
 
-        angular_idx = np.where(CathCanonicalAnglesDataset.feature_is_angular["angles"])[
-            0
-        ]
+        angular_idx = np.where(CathCanonicalAnglesDataset.feature_is_angular["angles"])[0]
         # assert utils.tolerant_comparison_check(
         #     angles[:, angular_idx], ">=", -np.pi
         # ), f"Illegal value: {np.min(angles[:, angular_idx])}"
@@ -524,9 +1375,9 @@ class CathCanonicalAnglesSequenceDataset(CathCanonicalAnglesDataset):
     Amino acid sequence: one-hot encoded amino acid sequence
     """
 
-    feature_names = {"angles": ["phi", "psi", "omega", "tau", "CA:C:1N", "C:1N:1CA"] + AMINO_ACID_LIST}
-    feature_is_angular = {"angles": [True, True, True, True, True, True] + [False for _ in range(len(AMINO_ACID_LIST))]}
-    noise_mask = {"angles": torch.tensor([True, True, True, True, True, True] + [False for _ in range(len(AMINO_ACID_LIST))]).bool()}
+    feature_names = {"angles": ["phi", "psi", "omega"] + AMINO_ACID_LIST}
+    feature_is_angular = {"angles": torch.tensor([True, True, True] + [False for _ in range(len(AMINO_ACID_LIST))]).bool()}
+    noise_mask = {"angles": torch.tensor([True, True, True] + [False for _ in range(len(AMINO_ACID_LIST))]).bool()}
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -715,7 +1566,7 @@ class AnglesEmptySequenceDataset(Dataset):
             f"Angularity definitions: {self.feature_is_angular} | {self.feature_names}"
         )
         self.pad = pad
-        self._mean_offset = mean_offset
+        self._mean_offset = mean_offset[:len(self.feature_names[k][self.noise_mask[k]])]
         if self._mean_offset is not None:
             assert self._mean_offset.size == len(self.feature_names[k][self.noise_mask[k]])
 
@@ -835,10 +1686,11 @@ class NoisedAnglesDataset(Dataset):
         assert hasattr(dset, "feature_names")
         assert hasattr(dset, "feature_is_angular")
         self.dset_key = dset_key
-        assert (
+        if dset_key is not None:
+            assert (
             dset_key in dset.feature_is_angular
-        ), f"{dset_key} not in {dset.feature_is_angular}"
-        self.n_features = len(dset.feature_is_angular[dset_key])
+            ), f"{dset_key} not in {dset.feature_is_angular}"
+        self.n_features = len(self.feature_is_angular)
 
         self.nonangular_var_scale = nonangular_variance
         self.angular_var_scale = angular_variance
@@ -855,12 +1707,26 @@ class NoisedAnglesDataset(Dataset):
     @property
     def feature_names(self):
         """Pass through feature names property of wrapped dset"""
-        return self.dset.feature_names
+        if self.dset_key is not None:
+            return self.dset.feature_names[self.dset_key]
+        else:
+            return self.dset.feature_names
 
     @property
     def feature_is_angular(self):
         """Pass through feature is angular property of wrapped dset"""
-        return self.dset.feature_is_angular
+        if self.dset_key is not None:
+            return self.dset.feature_is_angular[self.dset_key]
+        else:
+            return self.dset.feature_is_angular
+
+    @property
+    def noise_mask(self):
+        """Pass through feature is angular property of wrapped dset"""
+        if self.dset_key is not None:
+            return self.dset.noise_mask[self.dset_key]
+        else:
+            return self.dset.noise_mask
 
     @property
     def pad(self):
@@ -913,13 +1779,13 @@ class NoisedAnglesDataset(Dataset):
             for j in range(noise.shape[-1]):  # Last dim = feature dim
                 s = (
                     self.angular_var_scale
-                    if self.dset.feature_is_angular[self.dset_key][j]
+                    if self.feature_is_angular[j]
                     else self.nonangular_var_scale
                 )
                 noise[..., j] *= s
 
         # Make sure that the noise doesn't run over the boundaries
-        angular_idx = np.where(self.dset.feature_is_angular[self.dset_key])[0]
+        angular_idx = np.where(self.feature_is_angular)[0]
         noise[..., angular_idx] = utils.modulo_with_wrapped_range(
             noise[..., angular_idx], -np.pi, np.pi
         )
@@ -986,16 +1852,15 @@ class NoisedAnglesDataset(Dataset):
         noise = self.sample_noise(vals)  # Vals passed in only for shape
 
         # Add noise and ensure noised vals are still in range
-        # TODO: Modify the noising process such that the amino acid sequence is not noised
         noised_vals = (
             sqrt_alphas_cumprod_t * vals + sqrt_one_minus_alphas_cumprod_t * noise
         )
         # For the amino acid sequence, we should not add noise
-        noised_vals[..., ~self.dset.noise_mask[self.dset_key]] = vals[..., ~self.dset.noise_mask[self.dset_key]]
+        noised_vals[..., ~self.noise_mask] = vals[..., ~self.noise_mask]
         assert noised_vals.shape == vals.shape, f"Unexpected shape {noised_vals.shape}"
         # The underlying vals are already shifted, and noise is already shifted
         # All we need to do is ensure we stay on the corresponding manifold
-        angular_idx = np.where(self.dset.feature_is_angular[self.dset_key])[0]
+        angular_idx = np.where(self.feature_is_angular)[0]
         # Wrap around the correct range
         noised_vals[:, angular_idx] = utils.modulo_with_wrapped_range(
             noised_vals[:, angular_idx], -np.pi, np.pi

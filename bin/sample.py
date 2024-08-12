@@ -345,7 +345,7 @@ def main() -> None:
     # Checks
     sweep_min_len, sweep_max_len = args.lengths
     assert sweep_min_len < sweep_max_len
-    assert sweep_max_len <= train_dset.dset.pad
+    assert sweep_max_len <= train_dset.dset.pad + 1
 
     # Perform sampling
     torch.manual_seed(args.seed)

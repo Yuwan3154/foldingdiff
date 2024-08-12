@@ -33,6 +33,7 @@ from tqdm.auto import tqdm
 
 from foldingdiff import losses, nerf
 from foldingdiff.datasets import FEATURE_SET_NAMES_TO_ANGULARITY, FEATURE_SET_NAMES_TO_NOISE_MASK
+from foldingdiff.beta_schedules import cosine_beta_schedule
 
 LR_SCHEDULE = Optional[Literal["OneCycleLR", "LinearWarmup"]]
 TIME_ENCODING = Literal["gaussian_fourier", "sinusoidal"]
@@ -334,7 +335,6 @@ class BertForDiffusionBase(BertPreTrainedModel):
             logging.info(f"Auto constructed ft_is_angular: {ft_is_angular}")
 
         if noise_mask is None:
-            print(FEATURE_SET_NAMES_TO_NOISE_MASK)
             noise_mask = FEATURE_SET_NAMES_TO_NOISE_MASK[
                 train_args["angles_definitions"]
             ]
@@ -570,6 +570,10 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         if self.write_preds_to_dir:
             os.makedirs(self.write_preds_to_dir, exist_ok=True)
 
+        self.phi_index = list(self.ft_names).index("phi")
+        self.psi_index = list(self.ft_names).index("psi")
+        self.omega_index = list(self.ft_names).index("omega")
+
     def _get_loss_terms(
         self, batch, write_preds: Optional[str] = None
     ) -> List[torch.Tensor]:
@@ -642,7 +646,7 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
             # The alpha* have shape of [batch], e.g. [32]
             # corrupted have shape of [batch, seq_len, num_angles], e.g. [32, 128, 6]
             denoised_angles = (
-                batch["corrupted"]
+                batch["corrupted"][..., self.noise_mask]
                 - batch["sqrt_one_minus_alphas_cumprod_t"].view(bs, 1, 1)
                 * predicted_noise
             )
@@ -650,22 +654,14 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
 
             known_angles = batch["angles"]
             inferred_coords = nerf.nerf_build_batch(
-                phi=known_angles[:, :, self.ft_names.index("phi")],
-                psi=known_angles[:, :, self.ft_names.index("psi")],
-                omega=known_angles[:, :, self.ft_names.index("omega")],
-                bond_angle_n_ca_c=known_angles[:, :, self.ft_names.index("tau")],
-                bond_angle_ca_c_n=known_angles[:, :, self.ft_names.index("CA:C:1N")],
-                bond_angle_c_n_ca=known_angles[:, :, self.ft_names.index("C:1N:1CA")],
+                phi=known_angles[:, :, self.phi_index],
+                psi=known_angles[:, :, self.psi_index],
+                omega=known_angles[:, :, self.omega_index],
             )
             denoised_coords = nerf.nerf_build_batch(
-                phi=denoised_angles[:, :, self.ft_names.index("phi")],
-                psi=denoised_angles[:, :, self.ft_names.index("psi")],
-                omega=denoised_angles[:, :, self.ft_names.index("omega")],
-                bond_angle_n_ca_c=denoised_angles[:, :, self.ft_names.index("tau")],
-                bond_angle_ca_c_n=denoised_angles[:, :, self.ft_names.index("CA:C:1N")],
-                bond_angle_c_n_ca=denoised_angles[
-                    :, :, self.ft_names.index("C:1N:1CA")
-                ],
+                phi=denoised_angles[:, :, self.phi_index],
+                psi=denoised_angles[:, :, self.psi_index],
+                omega=denoised_angles[:, :, self.omega_index],
             )
             ca_idx = torch.arange(start=1, end=denoised_coords.shape[1], step=3)
             denoised_ca_coords = denoised_coords[:, ca_idx, :]
@@ -678,11 +674,17 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
             if isinstance(self.use_pairwise_dist_loss, (list, tuple)):
                 min_coef, max_coef, max_timesteps = self.use_pairwise_dist_loss
                 assert 0 < min_coef < max_coef
-                # Linearly interpolate between min and max based on the timestep
-                # of each item in the batch
-                coef = min_coef + (max_coef - min_coef) * (
-                    (max_timesteps - batch["t"]) / max_timesteps
-                ).to(batch["t"].device)
+                
+                # Cosine schedule between min and max based on the timestep
+                schedule = cosine_beta_schedule(max_timesteps).to(batch["t"].device)
+                coef = min_coef + (max_coef - min_coef) * schedule[(max_timesteps - 1 - batch["t"])]
+
+                # # Linearly interpolate between min and max based on the timestep
+                # # of each item in the batch
+                # coef = min_coef + (max_coef - min_coef) * (
+                #     (max_timesteps - batch["t"]) / max_timesteps
+                # ).to(batch["t"].device)
+
                 assert torch.all(coef > 0)
             else:
                 coef = self.use_pairwise_dist_loss
@@ -694,6 +696,8 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
                 lengths=batch["lengths"],
                 weights=coef,
             )
+            # Log the squared pairwise distance loss
+            pdist_loss = torch.log(pdist_loss**2 + 1)
             loss_terms.append(pdist_loss)
 
         return torch.stack(loss_terms)
@@ -711,7 +715,7 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
             avg_loss += self.l1_lambda * l1_penalty
 
         pseudo_ft_names = (
-            (self.ft_names[self.noise_mask] + ["pairwise_dist_loss"])
+            np.concatenate((self.ft_names[self.noise_mask], np.array(["pairwise_dist_loss"])))
             if self.use_pairwise_dist_loss
             else self.ft_names[self.noise_mask]
         )
@@ -755,7 +759,7 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
 
         # Log each of the loss terms
         pseudo_ft_names = (
-            (self.ft_names[self.noise_mask] + ["pairwise_dist_loss"])
+            np.concatenate((self.ft_names[self.noise_mask], np.array(["pairwise_dist_loss"])))
             if self.use_pairwise_dist_loss
             else self.ft_names[self.noise_mask]
         )
