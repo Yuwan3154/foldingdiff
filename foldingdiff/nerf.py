@@ -217,89 +217,18 @@ def nerf_build_batch(
 ) -> torch.Tensor:
     """
     Build out a batch of phi, psi, omega values. Returns the 3D coordinates
-    in Cartesian space with the shape (batch, length * 3, 3). Here, length is
-    multiplied by 3 because for each backbone, there are coordinates for the
-    N-CA-C atoms.
+    in Cartesian space with the shape (batch, length, atoms, xyz).
     """
     assert phi.ndim == psi.ndim == omega.ndim == 2  # batch, seq
     assert phi.shape == psi.shape == omega.shape
-    batch = phi.shape[0]
 
     # Use Sergey's code instead of the original implementation
     batch_dih = torch.stack([phi, psi, omega], dim=-1)
     
     # The returned shape is (batch, length, atoms=(N,CA,C,CB,O), coords=(x,y,z))
     coords = dih_to_coord(batch_dih, add_ob=False, requires_grad=True)
-    # Reshape to (batch, length * 3, 3)
-    coords = coords.reshape(batch, -1, 3)
 
     return coords
-
-    # # (batch, seq, 3)
-    # coords = (
-    #     torch.tensor(np.array([N_INIT, CA_INIT, C_INIT]), requires_grad=True)
-    #     .repeat(batch, 1, 1)
-    #     .to(phi.device)
-    # )
-    # assert coords.shape == (batch, 3, 3), f"Mismatched shape: {coords.shape}"
-
-    # # perform broadcasting of bond lengths
-    # ensure_tensor = (
-    #     lambda x: torch.tensor(x, requires_grad=False).expand(phi.shape)
-    #     if isinstance(x, float)
-    #     else x
-    # )
-    # bond_len_n_ca = ensure_tensor(bond_len_n_ca)
-    # bond_len_ca_c = ensure_tensor(bond_len_ca_c)
-    # bond_len_c_n = ensure_tensor(bond_len_c_n)
-
-    # phi = phi[:, 1:]
-    # psi = psi[:, :-1]
-    # omega = omega[:, :-1]
-    # assert phi.shape == psi.shape == omega.shape
-
-    # for i in range(phi.shape[1]):
-    #     # Place the C-N
-    #     n_coord = place_dihedral(
-    #         coords[:, -3, :],  # after indexing, shape is (batch, 3)
-    #         coords[:, -2, :],
-    #         coords[:, -1, :],
-    #         bond_angle=bond_angle_ca_c_n[:, i].unsqueeze(1),
-    #         bond_length=bond_len_c_n[:, i].unsqueeze(1),
-    #         torsion_angle=psi[:, i].unsqueeze(1),
-    #         use_torch=True,
-    #     )
-
-    #     # Place the N-CA
-    #     ca_coord = place_dihedral(
-    #         coords[:, -2, :],
-    #         coords[:, -1, :],
-    #         n_coord,
-    #         bond_angle=bond_angle_c_n_ca[:, i].unsqueeze(1),
-    #         bond_length=bond_len_n_ca[:, i].unsqueeze(1),
-    #         torsion_angle=omega[:, i].unsqueeze(1),
-    #         use_torch=True,
-    #     )
-
-    #     # Place the CA-C
-    #     c_coord = place_dihedral(
-    #         coords[:, -1, :],
-    #         n_coord,
-    #         ca_coord,
-    #         bond_angle=bond_angle_n_ca_c[:, i].unsqueeze(1),
-    #         bond_length=bond_len_ca_c[:, i].unsqueeze(1),
-    #         torsion_angle=phi[:, i].unsqueeze(1),
-    #         use_torch=True,
-    #     )
-
-    #     # coordinates have shape (batch, 3) --> (batch, 1, 3)
-    #     coords = torch.cat(
-    #         [coords, n_coord.unsqueeze(1), ca_coord.unsqueeze(1), c_coord.unsqueeze(1)],
-    #         dim=1,
-    #     )
-    #     assert coords.shape[-1] == 3 and coords.shape[0] == batch
-
-    # return coords
 
 
 # Code adapted from Sergey Ovchinnikov

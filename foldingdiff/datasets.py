@@ -26,9 +26,10 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 
-LOCAL_DATA_DIR = Path(
-    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
-)
+LOCAL_DATA_DIR = Path.home() / "data"
+# LOCAL_DATA_DIR = Path(
+#     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+# )
 
 CATH_DIR = LOCAL_DATA_DIR / "cath"
 ALPHAFOLD_DIR = LOCAL_DATA_DIR / "alphafold"
@@ -636,6 +637,7 @@ class FoldBalancedDihedralSequenceDataset(Dataset):
             Literal["cath_idealized", "cath_af_idealized"], str
         ] = "cath_af_idealized",  # Keyword or a directory
         split: Optional[Literal["train", "test", "validation"]] = None,
+        split_by: str = "homology",
         pad: int = 9,
         min_length: int = 0,  # Set to 0 to disable
         trim_strategy: TRIM_STRATEGIES = "randomcrop",
@@ -675,31 +677,32 @@ class FoldBalancedDihedralSequenceDataset(Dataset):
         # functional parity with the original CATH dataset. Original CATH uses
         # a 80/10/10 split
         # Shuffle the sequences so contiguous splits acts like random splits
-        # TODO: Decide how to split the folds
         self.rng = np.random.default_rng(seed=6489)
         if self.shuffle:
             self.rng.shuffle(self.folds)
 
-
         if split is not None:
-            split_idx = int(len(self.folds) * 0.8)
-            if split == "train":
-                self.folds = self.folds[:split_idx]
-                self.length_multiplier = 100
-            elif split == "validation":
-                self.folds = self.folds[
-                    split_idx : split_idx + int(len(self.folds) * 0.1)
-                ]
-                self.length_multiplier = 10
-            elif split == "test":
-                self.folds = self.folds[
-                    split_idx + int(len(self.folds) * 0.1) :
-                ]
-                self.length_multiplier = 1
-            else:
-                raise ValueError(f"Unknown split: {split}")
+            if split_by == "fold":
+                split_idx = int(len(self.folds) * 0.8)
+                if split == "train":
+                    self.folds = self.folds[:split_idx]
+                    self.length_multiplier = 100
+                elif split == "validation":
+                    self.folds = self.folds[
+                        split_idx : split_idx + int(len(self.folds) * 0.1)
+                    ]
+                    self.length_multiplier = 10
+                elif split == "test":
+                    self.folds = self.folds[
+                        split_idx + int(len(self.folds) * 0.1) :
+                    ]
+                    self.length_multiplier = 1
+                else:
+                    raise ValueError(f"Unknown split: {split}")
+            elif split_by == "homology":
+                raise NotImplementedError
 
-            logging.info(f"Split {split} contains folds: {self.folds} ")
+            logging.info(f"Split {split} contains folds: {self.folds}")
             self.summary_data = self.summary_data[self.summary_data["Topology"].isin(self.folds)]
             # Pop folds that are not in the split
             self.structures = {fold: self.structures[fold] for fold in self.folds}

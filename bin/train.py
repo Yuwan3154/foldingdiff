@@ -111,6 +111,7 @@ def plot_kl_divergence(train_dset, plots_folder: Path) -> None:
 def get_train_valid_test_sets(
     dataset_key: str = "cath",
     angles_definitions: ANGLES_DEFINITIONS = "canonical-full-angles",
+    split_by: str = "homology",
     max_seq_len: int = 512,
     min_seq_len: int = 0,
     seq_trim_strategy: datasets.TRIM_STRATEGIES = "leftalign",
@@ -154,6 +155,7 @@ def get_train_valid_test_sets(
         clean_dset_class(
             pdbs=dataset_key,
             split=s,
+            split_by=split_by,
             pad=max_seq_len,
             min_length=min_seq_len,
             trim_strategy=seq_trim_strategy,
@@ -307,8 +309,10 @@ def train(
     # Controls output
     results_dir: str = "./results",
     # Controls data loading and noising process
+    model_dir: str = None,
     dataset_key: str = "cath",  # cath, alhpafold, or a directory containing pdb files
     angles_definitions: ANGLES_DEFINITIONS = "canonical-full-angles",
+    split_by: str = "homology",
     max_seq_len: int = 512,
     min_seq_len: int = 0,  # 0 means no filtering based on min sequence length
     trim_strategy: datasets.TRIM_STRATEGIES = "leftalign",
@@ -334,6 +338,9 @@ def train(
     use_pdist_loss: Union[
         float, Tuple[float, float]
     ] = 0.0,  # Use the pairwise distances between CAs as an additional loss term, multiplied by this scalar
+    use_fape_loss: Union[
+        float, Tuple[float, float]
+    ] = 0.0,  # Use the FAPE loss as an additional loss term, multiplied by this scalar
     l2_norm: float = 0.0,  # AdamW default has 0.01 L2 regularization, but BERT trainer uses 0.0
     l1_norm: float = 0.0,
     circle_reg: float = 0.0,
@@ -368,6 +375,7 @@ def train(
     dsets = get_train_valid_test_sets(
         dataset_key=dataset_key,
         angles_definitions=angles_definitions,
+        split_by=split_by,
         max_seq_len=max_seq_len,
         min_seq_len=min_seq_len,
         seq_trim_strategy=trim_strategy,
@@ -457,28 +465,34 @@ def train(
     )
     # ft_is_angular from the clean datasets angularity definition
     ft_key = "coords" if angles_definitions == "cart-coords" else "angles"
-    model = modelling.BertForDiffusion(
-        config=cfg,
-        time_encoding=time_encoding,
-        decoder=decoder,
-        ft_is_angular=dsets[0].dset.feature_is_angular[ft_key],
-        ft_names=dsets[0].dset.feature_names[ft_key],
-        lr=lr,
-        loss=loss_fn,
-        use_pairwise_dist_loss=use_pdist_loss
-        if isinstance(use_pdist_loss, float)
-        else [*use_pdist_loss, timesteps],
-        l2=l2_norm,
-        l1=l1_norm,
-        circle_reg=circle_reg,
-        epochs=max_epochs,
-        steps_per_epoch=len(train_dataloader),
-        lr_scheduler=lr_scheduler,
-        write_preds_to_dir=results_folder / "valid_preds"
-        if write_valid_preds
-        else None,
-        noise_mask=dsets[0].dset.noise_mask[ft_key],
-    )
+    if model_dir is None:
+        model = modelling.BertForDiffusion(
+            config=cfg,
+            time_encoding=time_encoding,
+            decoder=decoder,
+            ft_is_angular=dsets[0].dset.feature_is_angular[ft_key],
+            ft_names=dsets[0].dset.feature_names[ft_key],
+            lr=lr,
+            loss=loss_fn,
+            use_pairwise_dist_loss=use_pdist_loss
+            if isinstance(use_pdist_loss, float)
+            else [*use_pdist_loss, timesteps],
+            use_fape_loss=use_fape_loss
+            if isinstance(use_fape_loss, float)
+            else [*use_fape_loss, timesteps],
+            l2=l2_norm,
+            l1=l1_norm,
+            circle_reg=circle_reg,
+            epochs=max_epochs,
+            steps_per_epoch=len(train_dataloader),
+            lr_scheduler=lr_scheduler,
+            write_preds_to_dir=results_folder / "valid_preds"
+            if write_valid_preds
+            else None,
+            noise_mask=dsets[0].dset.noise_mask[ft_key],
+        )
+    else:
+        model = modelling.BertForDiffusionBase.from_dir(model_dir).to(device)
     # https://stackoverflow.com/questions/49201236/check-the-total-number-of-parameters-in-a-pytorch-model
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logging.info(f"Model has {num_params} trainable parameters")
@@ -593,6 +607,7 @@ def main():
             "continue_from": args.continue_from,
         },
     )
+    os.makedirs(args.outdir, exist_ok=True)
     train(**config_args)
 
 

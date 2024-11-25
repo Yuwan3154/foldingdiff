@@ -2,7 +2,7 @@
 Loss functions!
 """
 from typing import Optional, Sequence, Tuple
-
+import numpy as np
 import torch
 from torch.nn import functional as F
 
@@ -149,6 +149,85 @@ def pairwise_dist_loss(
     return torch.mean(loss)
 
 
+def robust_norm(x, mask, axis=-1, keepdims=False, eps=1e-8):
+    """
+    Compute the robust norm of a tensor along a specified axis, adding a small epsilon to avoid division by zero.
+    Account for masking to avoid bias due to differing lengths of masked entries.
+    """
+    masked_x = x * mask.unsqueeze(axis)
+    sum_squared = torch.sum(masked_x**2, dim=axis, keepdim=keepdims)
+    norm = torch.sqrt(sum_squared + eps)
+    return norm
+
+
+def get_R(N, CA, C, mask):
+    """
+    Compute the rotation matrix that aligns the N, CA, and C atoms of a protein backbone.
+    """
+    v1 = C - CA
+    v2 = N - CA
+
+    e1 = v1 / robust_norm(v1, mask, axis=-1, keepdims=True)
+    c = torch.sum(e1 * v2, dim=-1, keepdim=True)
+    e2 = v2 - c * e1
+    e2 = e2 / robust_norm(e2, mask, axis=-1, keepdims=True)
+    e3 = torch.cross(e1, e2, dim=-1)
+
+    return torch.stack([e1, e2, e3], dim=-1)
+
+
+def get_ij(R, T):
+    """
+    Apply the rotation matrix R to the coordinates T to transform them.
+    """
+    delta = T[:, None, :, :] - T[:, :, None, :]
+    transformed = torch.einsum('brji,brsj->brsi', R, delta)
+    return transformed
+
+
+def loss_fn(t, p, m, clamp=10.0):
+    """
+    Compute the FAPE loss between transformed true and predicted coordinates.
+    """
+    pair_mask = m.unsqueeze(1) & m.unsqueeze(2)
+    fape = robust_norm(t - p, pair_mask)
+    fape = torch.clamp(fape, max=clamp) / 10.0
+
+    valid_mask_count = torch.sum(pair_mask, dim=(-1, -2)).clamp(min=1)
+    
+    masked_fape = fape * pair_mask
+    mean_fape = torch.sum(masked_fape, dim=(-1, -2)) / valid_mask_count
+
+    return mean_fape
+
+
+def fape_loss(
+    true_positions: torch.Tensor,
+    pred_positions: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    weights: Optional[torch.Tensor] = None,
+    clamp=10.0):
+    """
+    Compute the FAPE loss between true and predicted backbone positions (N, CA, C),
+    and apply a loss schedule to the computed FAPE values.
+    """
+    if mask is None:
+        mask = torch.ones(true_positions.shape[:2], dtype=torch.bool)
+    
+    true_R = get_R(true_positions[:, :, 0, :], true_positions[:, :, 1, :], true_positions[:, :, 2, :], mask)
+    pred_R = get_R(pred_positions[:, :, 0, :], pred_positions[:, :, 1, :], pred_positions[:, :, 2, :], mask)
+
+    true_transformed = get_ij(true_R, true_positions[:, :, 1, :])
+    pred_transformed = get_ij(pred_R, pred_positions[:, :, 1, :])
+    
+    loss_per_batch = loss_fn(true_transformed, pred_transformed, mask, clamp=clamp)
+    if weights is not None:
+        loss_per_batch *= weights
+    final_loss = torch.mean(loss_per_batch)
+    
+    return final_loss
+
+
 def main():
     lengths = torch.randint(2, 5, size=(16,)) * 3
     x = torch.randn(16, 12, 3)
@@ -157,6 +236,12 @@ def main():
     l = pairwise_dist_loss(x, y, lengths)
     print(l)
 
+    x = torch.randn(16, 12, 3, 3)
+    y = torch.randn(16, 12, 3, 3)
+    mask = torch.ones(16, 12, dtype=torch.bool)
+    coef = torch.ones(16)
+    f_l = fape_loss(x, y, mask, coef)
+    print(f_l)
 
 if __name__ == "__main__":
     import doctest

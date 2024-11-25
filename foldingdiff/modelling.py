@@ -514,6 +514,7 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         lr: float = 5e-5,
         loss: Union[Callable, LOSS_KEYS] = "smooth_l1",
         use_pairwise_dist_loss: Union[float, Tuple[float, float, int]] = 0.0,
+        use_fape_loss: Union[float, Tuple[float, float, int]] = 0.0,
         l2: float = 0.0,
         l1: float = 0.0,
         circle_reg: float = 0.0,
@@ -557,6 +558,7 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
             ), f"Got {len(self.loss_func)} loss functions, expected {self.n_outputs}"
 
         self.use_pairwise_dist_loss = use_pairwise_dist_loss
+        self.use_fape_loss = use_fape_loss
         self.l1_lambda = l1
         self.l2_lambda = l2
         self.circle_lambda = circle_reg
@@ -640,6 +642,9 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         if (
             isinstance(self.use_pairwise_dist_loss, (list, tuple))
             or self.use_pairwise_dist_loss > 0
+        ) or (
+            isinstance(self.use_fape_loss, (list, tuple))
+            or self.use_fape_loss > 0
         ):
             # Compute the pairwise distance loss
             bs = batch["sqrt_one_minus_alphas_cumprod_t"].shape[0]
@@ -663,42 +668,74 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
                 psi=denoised_angles[:, :, self.psi_index],
                 omega=denoised_angles[:, :, self.omega_index],
             )
-            ca_idx = torch.arange(start=1, end=denoised_coords.shape[1], step=3)
-            denoised_ca_coords = denoised_coords[:, ca_idx, :]
-            inferred_ca_coords = inferred_coords[:, ca_idx, :]
+            denoised_ca_coords = denoised_coords[:, 1, :]
+            inferred_ca_coords = inferred_coords[:, 1, :]
             assert (
                 inferred_ca_coords.shape == denoised_ca_coords.shape
             ), f"{inferred_ca_coords.shape} != {denoised_ca_coords.shape}"
 
-            # Determine coefficient for this loss term
-            if isinstance(self.use_pairwise_dist_loss, (list, tuple)):
-                min_coef, max_coef, max_timesteps = self.use_pairwise_dist_loss
-                assert 0 < min_coef < max_coef
-                
-                # Cosine schedule between min and max based on the timestep
-                schedule = cosine_beta_schedule(max_timesteps).to(batch["t"].device)
-                coef = min_coef + (max_coef - min_coef) * schedule[(max_timesteps - 1 - batch["t"])]
+            
+            if (
+                isinstance(self.use_pairwise_dist_loss, (list, tuple))
+                or self.use_pairwise_dist_loss > 0
+            ):
+                # Determine coefficient for this loss term
+                if isinstance(self.use_pairwise_dist_loss, (list, tuple)):
+                    min_coef, max_coef, max_timesteps = self.use_pairwise_dist_loss
+                    assert 0 < min_coef < max_coef
+                    
+                    # Cosine schedule between min and max based on the timestep
+                    schedule = cosine_beta_schedule(max_timesteps).to(batch["t"].device)
+                    coef = min_coef + (max_coef - min_coef) * schedule[(max_timesteps - 1 - batch["t"])]
 
-                # # Linearly interpolate between min and max based on the timestep
-                # # of each item in the batch
-                # coef = min_coef + (max_coef - min_coef) * (
-                #     (max_timesteps - batch["t"]) / max_timesteps
-                # ).to(batch["t"].device)
+                    # # Linearly interpolate between min and max based on the timestep
+                    # # of each item in the batch
+                    # coef = min_coef + (max_coef - min_coef) * (
+                    #     (max_timesteps - batch["t"]) / max_timesteps
+                    # ).to(batch["t"].device)
 
-                assert torch.all(coef > 0)
-            else:
-                coef = self.use_pairwise_dist_loss
-                assert coef > 0
+                    assert torch.all(coef > 0)
+                else:
+                    coef = self.use_pairwise_dist_loss
+                    assert coef > 0
 
-            pdist_loss = losses.pairwise_dist_loss(
+                pdist_loss = losses.pairwise_dist_loss(
                 denoised_ca_coords,
                 inferred_ca_coords,
                 lengths=batch["lengths"],
                 weights=coef,
-            )
-            # Log the squared pairwise distance loss
-            pdist_loss = torch.log(pdist_loss**2 + 1)
-            loss_terms.append(pdist_loss)
+                )
+                # Log the squared pairwise distance loss
+                pdist_loss = torch.log(pdist_loss**2 + 1)
+                loss_terms.append(pdist_loss)    
+
+            if (
+                isinstance(self.use_fape_loss, (list, tuple))
+                or self.use_fape_loss > 0
+            ):
+                # Determine coefficient for this loss term
+                if isinstance(self.use_fape_loss, (list, tuple)):
+                    min_coef, max_coef, max_timesteps = self.use_fape_loss
+                    assert 0 < min_coef < max_coef
+                    
+                    # Cosine schedule between min and max based on the timestep
+                    schedule = cosine_beta_schedule(max_timesteps).to(batch["t"].device)
+                    coef = min_coef + (max_coef - min_coef) * schedule[(max_timesteps - 1 - batch["t"])]
+
+                    assert torch.all(coef > 0)
+                else:
+                    coef = self.use_fape_loss
+                    assert coef > 0
+                mask = torch.zeros(denoised_coords.shape[:2], dtype=torch.bool).to(batch["t"].device)
+                for i in range(batch["lengths"].shape[0]):
+                    mask[i, :batch["lengths"][i]] = True
+                fape_loss = losses.fape_loss(
+                    denoised_coords,
+                    inferred_coords,
+                    mask=mask,
+                    weights=coef.squeeze(),
+                )
+                loss_terms.append(fape_loss)
 
         return torch.stack(loss_terms)
 
@@ -714,11 +751,11 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
             l1_penalty = sum(torch.linalg.norm(p, 1) for p in self.parameters())
             avg_loss += self.l1_lambda * l1_penalty
 
-        pseudo_ft_names = (
-            np.concatenate((self.ft_names[self.noise_mask], np.array(["pairwise_dist_loss"])))
-            if self.use_pairwise_dist_loss
-            else self.ft_names[self.noise_mask]
-        )
+        pseudo_ft_names = self.ft_names[self.noise_mask]
+        if self.use_pairwise_dist_loss:
+            pseudo_ft_names = np.concatenate((pseudo_ft_names, np.array(["pairwise_dist_loss"])))
+        if self.use_fape_loss:
+            pseudo_ft_names = np.concatenate((pseudo_ft_names, np.array(["fape_loss"])))
         assert len(loss_terms) == len(pseudo_ft_names)
         loss_dict = {
             f"train_loss_{val_name}": val
@@ -758,11 +795,11 @@ class BertForDiffusion(BertForDiffusionBase, pl.LightningModule):
         avg_loss = torch.mean(loss_terms)
 
         # Log each of the loss terms
-        pseudo_ft_names = (
-            np.concatenate((self.ft_names[self.noise_mask], np.array(["pairwise_dist_loss"])))
-            if self.use_pairwise_dist_loss
-            else self.ft_names[self.noise_mask]
-        )
+        pseudo_ft_names = self.ft_names[self.noise_mask]
+        if self.use_pairwise_dist_loss:
+            pseudo_ft_names = np.concatenate((pseudo_ft_names, np.array(["pairwise_dist_loss"])))
+        if self.use_fape_loss:
+            pseudo_ft_names = np.concatenate((pseudo_ft_names, np.array(["fape_loss"])))
         assert len(loss_terms) == len(pseudo_ft_names)
         loss_dict = {
             f"val_loss_{val_name}": self.all_gather(val)
